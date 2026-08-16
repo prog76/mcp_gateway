@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mcp_policy_proxy.start — Container entrypoint that reproduces start.sh behavior.
+mcp_gateway.start — Container entrypoint that reproduces start.sh behavior.
 
 Starts the background MCP server processes (k8s, netbox, foxmcp, skills), then
 runs the policy proxy in the foreground:
@@ -10,7 +10,7 @@ runs the policy proxy in the foreground:
   3. Start background MCP servers (skills via the `skills-server` console
      script from the skills-server pip package)
   4. Run a watchdog that restarts dead background servers
-  5. Start the policy proxy (foreground) via ``mcp_policy_proxy.policy_proxy.main()``
+  5. Start the policy proxy (foreground) via ``mcp_gateway.policy_proxy.main()``
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-log = logging.getLogger("policy-proxy-start")
+log = logging.getLogger("mcp-gateway-start")
 
 
 def _env(key: str, default: str) -> str:
@@ -61,7 +61,7 @@ def _build_mcp_servers(kubeconfig_path: str) -> List[Dict[str, str]]:
         "name": "foxmcp",
         "port": "9005",
         "cmd": python,
-        "args": ["-m", "mcp_policy_proxy.foxmcp_server", "--mcp-port", "9005", "--ws-port", "8765"],
+        "args": ["-m", "mcp_gateway.foxmcp_server", "--mcp-port", "9005", "--ws-port", "8765"],
     })
 
     # skills — from the skills-server pip package (console script)
@@ -96,7 +96,7 @@ def validate_policies(policy_dir: str, validate_policy_path: str) -> None:
         log.info("  Validating: %s", full_path)
         try:
             # Import the installed package's validate_policy module.
-            from mcp_policy_proxy.validate_policy import validate_policy as vp
+            from mcp_gateway.validate_policy import validate_policy as vp
             valid = vp(full_path)
             if not valid:
                 log.warning("Validation had warnings for %s", policy_file)
@@ -165,7 +165,7 @@ def run_watchdog(servers: List[ServerProcess], stop_event) -> None:
 
 async def run_proxy_forever() -> None:
     """Start the policy proxy (blocking foreground process)."""
-    from mcp_policy_proxy import policy_proxy
+    from mcp_gateway import policy_proxy
     await policy_proxy.main()
 
 

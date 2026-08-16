@@ -3,13 +3,13 @@ requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcp-policy-proxy"
+name = "mcp-gateway"
 version = "0.1.0"
 description = "MCP policy proxy with enforcement + compound endpoints"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-repository = "https://github.com/prog76/mcp_policy-proxy"
+repository = "https://github.com/prog76/mcp_gateway"
 dependencies = [
     "mcp2cli @ git+https://github.com/prog76/mcp_mcp2cli.git",
     "skills-server @ git+https://github.com/prog76/mcp_skills-server.git",
@@ -25,11 +25,11 @@ dependencies = [
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
-mcp-policy-proxy-start = "mcp_policy_proxy.start:main"
+mcp-gateway-start = "mcp_gateway.start:main"
 
 [project.urls]
-Homepage = "https://github.com/prog76/mcp_policy-proxy"
-Documentation = "https://github.com/prog76/mcp_policy-proxy#readme"
+Homepage = "https://github.com/prog76/mcp_gateway"
+Documentation = "https://github.com/prog76/mcp_gateway#readme"
 "mcp2cli upstream" = "https://github.com/prog76/mcp_mcp2cli"
 "skills-server upstream" = "https://github.com/prog76/mcp_skills-server"
 
@@ -40,7 +40,7 @@ Documentation = "https://github.com/prog76/mcp_policy-proxy#readme"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["mcp_policy_proxy"]
+packages = ["mcp_gateway"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

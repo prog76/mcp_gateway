@@ -1,4 +1,4 @@
-# mcp-policy-proxy
+# mcp-gateway
 
 MCP policy proxy with enforcement + compound endpoints.
 
@@ -10,19 +10,19 @@ for the shared MCP client library and the skills MCP server.
 
 | Module | Purpose |
 |---|---|
-| `mcp_policy_proxy.policy_proxy` | Core policy enforcement + compound endpoint aggregator (the FastMCP/Starlette app) |
-| `mcp_policy_proxy.mounted_server` | `MountedServer` — an MCP server mountable at a path in a Starlette app |
-| `mcp_policy_proxy.policy_yaml` | `PolicyLoader` — SafeLoader extended with a `!concat` tag |
-| `mcp_policy_proxy.validate_policy` | Policy file validator |
-| `mcp_policy_proxy.mcp_onboard` | Onboarding helper that generates starter policy YAML from discovered tools |
-| `mcp_policy_proxy.foxmcp_server` | Secure FoxMCP server (browser control via Firefox extension) |
-| `mcp_policy_proxy.foxmcp_vendored` | Vendored upstream FoxMCP server package |
-| `mcp_policy_proxy.start` | Container entrypoint that reproduces `start.sh` behavior |
+| `mcp_gateway.policy_proxy` | Core policy enforcement + compound endpoint aggregator (the FastMCP/Starlette app) |
+| `mcp_gateway.mounted_server` | `MountedServer` — an MCP server mountable at a path in a Starlette app |
+| `mcp_gateway.policy_yaml` | `PolicyLoader` — SafeLoader extended with a `!concat` tag |
+| `mcp_gateway.validate_policy` | Policy file validator |
+| `mcp_gateway.mcp_onboard` | Onboarding helper that generates starter policy YAML from discovered tools |
+| `mcp_gateway.foxmcp_server` | Secure FoxMCP server (browser control via Firefox extension) |
+| `mcp_gateway.foxmcp_vendored` | Vendored upstream FoxMCP server package |
+| `mcp_gateway.start` | Container entrypoint that reproduces `start.sh` behavior |
 
 ## Console script
 
 ```
-mcp-policy-proxy-start
+mcp-gateway-start
 ```
 
 This starts the background MCP servers (k8s, netbox, foxmcp, skills) and then
@@ -50,4 +50,4 @@ python -m pytest
 
 ## Publishing
 
-This tree is the source for `github.com/prog76/mcp_policy-proxy`.
+This tree is the source for `github.com/prog76/mcp_gateway`.

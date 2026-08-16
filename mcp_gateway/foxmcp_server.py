@@ -30,8 +30,8 @@ from urllib.parse import urlparse
 # Import FoxMCP upstream (vendored at foxmcp_vendored/)
 # The source is cloned from https://github.com/ThinkerYzu/foxmcp/tree/master/server
 # and vendored as foxmcp_vendored/ to avoid namespace conflict with the 'mcp' package.
-from mcp_policy_proxy.foxmcp_vendored.server import FoxMCPServer
-from mcp_policy_proxy.foxmcp_vendored.mcp_tools import FoxMCPTools
+from mcp_gateway.foxmcp_vendored.server import FoxMCPServer
+from mcp_gateway.foxmcp_vendored.mcp_tools import FoxMCPTools
 
 logger = logging.getLogger(__name__)
 

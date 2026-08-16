@@ -1,1 +1,1 @@
-"""Tests for mcp-policy-proxy."""
+"""Tests for mcp-gateway."""

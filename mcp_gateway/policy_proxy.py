@@ -44,13 +44,13 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp import ClientSession
 from mcp.shared.exceptions import McpError
 
-from mcp_policy_proxy.mounted_server import MountedServer
-from mcp_policy_proxy.policy_yaml import PolicyLoader
+from mcp_gateway.mounted_server import MountedServer
+from mcp_gateway.policy_yaml import PolicyLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("policy-proxy")
+log = logging.getLogger("mcp-gateway")
 
-# Silence noisy upstream loggers. We keep our own "policy-proxy" logger at
+# Silence noisy upstream loggers. We keep our own "mcp-gateway" logger at
 # INFO and add explicit tool-call logging, so the operator sees exactly what
 # tool was called and the result — without the MCP SDK / uvicorn chatter.
 for _noisy in ("mcp.server.streamable_http", "mcp.server.lowlevel.server", "uvicorn.access"):
@@ -1317,7 +1317,7 @@ async def main():
     if transport == "stdio":
         # Fallback: single FastMCP with prefixed tools
         from mcp.server.fastmcp import FastMCP
-        srv = FastMCP("policy-proxy")
+        srv = FastMCP("mcp-gateway")
         for bc, rules in backends:
             pfx = f"{bc.name}_"
             try:
