@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcp-gateway"
+name = "gateway"
 version = "0.1.0"
 description = "MCP policy proxy with enforcement + compound endpoints"
 readme = "README.md"
