@@ -16,7 +16,7 @@ import sys
 
 import yaml
 
-from mcp_gateway.policy_yaml import PolicyLoader
+from gateway.policy_yaml import PolicyLoader
 
 
 def _flatten_match_value(value):

@@ -20,19 +20,19 @@ import yaml
 # Ensure the package is importable (editable install or source tree)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import mcp_gateway  # noqa: E402
-from mcp_gateway import mounted_server  # noqa: E402
-from mcp_gateway import policy_proxy  # noqa: E402
-from mcp_gateway import policy_yaml  # noqa: E402
-from mcp_gateway import validate_policy  # noqa: E402
+import gateway  # noqa: E402
+from gateway import mounted_server  # noqa: E402
+from gateway import policy_proxy  # noqa: E402
+from gateway import policy_yaml  # noqa: E402
+from gateway import validate_policy  # noqa: E402
 
 
 def test_package_imports():
     """All core modules import cleanly."""
-    assert mcp_gateway.__version__ == "0.1.0"
-    assert mcp_gateway.policy_proxy is policy_proxy
-    assert hasattr(mcp_gateway.policy_proxy, "load_all_policies")
-    assert hasattr(mcp_gateway.policy_proxy, "MountedServer") or hasattr(
+    assert gateway.__version__ == "0.1.0"
+    assert gateway.policy_proxy is policy_proxy
+    assert hasattr(gateway.policy_proxy, "load_all_policies")
+    assert hasattr(gateway.policy_proxy, "MountedServer") or hasattr(
         policy_proxy, "MountedServer"
     )
 
@@ -205,7 +205,7 @@ def test_mounted_server_importable():
 
 def test_start_entrypoint_helpers():
     """The start module builds the background MCP server list (no network)."""
-    from mcp_gateway import start
+    from gateway import start
 
     # No kubeconfig -> skip k8s
     servers = start._build_mcp_servers("/nonexistent/kubeconfig")
@@ -221,7 +221,7 @@ def test_start_entrypoint_helpers():
 
 
 def test_start_main_entrypoint_registered():
-    """The console script references mcp_gateway.start.main."""
+    """The console script references gateway.start.main."""
     import importlib.metadata
 
     entry_points = importlib.metadata.entry_points()
@@ -233,4 +233,4 @@ def test_start_main_entrypoint_registered():
             ep_list.extend(eps)
     matching = [ep for ep in ep_list if ep.name == "mcp-gateway-start"]
     assert matching, "mcp-gateway-start console script not registered"
-    assert matching[0].value == "mcp_gateway.start:main"
+    assert matching[0].value == "gateway.start:main"

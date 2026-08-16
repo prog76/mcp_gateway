@@ -44,8 +44,8 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp import ClientSession
 from mcp.shared.exceptions import McpError
 
-from mcp_gateway.mounted_server import MountedServer
-from mcp_gateway.policy_yaml import PolicyLoader
+from gateway.mounted_server import MountedServer
+from gateway.policy_yaml import PolicyLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("mcp-gateway")

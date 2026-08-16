@@ -10,14 +10,14 @@ for the shared MCP client library and the skills MCP server.
 
 | Module | Purpose |
 |---|---|
-| `mcp_gateway.policy_proxy` | Core policy enforcement + compound endpoint aggregator (the FastMCP/Starlette app) |
-| `mcp_gateway.mounted_server` | `MountedServer` — an MCP server mountable at a path in a Starlette app |
-| `mcp_gateway.policy_yaml` | `PolicyLoader` — SafeLoader extended with a `!concat` tag |
-| `mcp_gateway.validate_policy` | Policy file validator |
-| `mcp_gateway.mcp_onboard` | Onboarding helper that generates starter policy YAML from discovered tools |
-| `mcp_gateway.foxmcp_server` | Secure FoxMCP server (browser control via Firefox extension) |
-| `mcp_gateway.foxmcp_vendored` | Vendored upstream FoxMCP server package |
-| `mcp_gateway.start` | Container entrypoint that reproduces `start.sh` behavior |
+| `gateway.policy_proxy` | Core policy enforcement + compound endpoint aggregator (the FastMCP/Starlette app) |
+| `gateway.mounted_server` | `MountedServer` — an MCP server mountable at a path in a Starlette app |
+| `gateway.policy_yaml` | `PolicyLoader` — SafeLoader extended with a `!concat` tag |
+| `gateway.validate_policy` | Policy file validator |
+| `gateway.mcp_onboard` | Onboarding helper that generates starter policy YAML from discovered tools |
+| `gateway.foxmcp_server` | Secure FoxMCP server (browser control via Firefox extension) |
+| `gateway.foxmcp_vendored` | Vendored upstream FoxMCP server package |
+| `gateway.start` | Container entrypoint that reproduces `start.sh` behavior |
 
 ## Console script
 
