@@ -29,7 +29,7 @@ This starts the background MCP servers (k8s, netbox, foxmcp, skills) and then
 runs the policy proxy in the foreground — the same behavior as the original
 `start.sh`.
 
-Environment variables:
+## Environment variables
 
 | Variable | Default |
 |---|---|
@@ -40,6 +40,77 @@ Environment variables:
 | `VALIDATE_POLICY_PATH` | `/opt/validate_policy.py` |
 | `COMPOUNDS_CONFIG` | `/etc/mcp-gateways/compounds.yaml` |
 | `NOTIFICATION_CONFIG` | `/etc/mcp-gateways/notifications.yaml` |
+| `MCP_REQUEST_HEADER_CAPTURE` | *(empty — disabled)* |
+
+`MCP_REQUEST_HEADER_CAPTURE` — comma-separated list of incoming HTTP header
+names to capture from the MCP client request. Captured headers are available
+for compound header resolution via `${request_header:NAME}`. Enables
+auth-passthrough (e.g. forwarding the client's `Authorization` header to the
+downstream backend).
+
+## Compound headers → policy injection
+
+Compounds can set HTTP headers for downstream backends, and policy rules can
+reference those header values as injected tool arguments. This creates an
+end-to-end flow:
+
+1. **Compound sets a header** — the compound's `headers:` block is merged
+   with the backend's own headers and sent to the downstream MCP backend.
+   Header values support per-request template variables:
+
+   | Template | Resolves to |
+   |---|---|
+   | `${env:VAR}` | Environment variable value |
+   | `${clientHost}` | Reverse-DNS hostname of the MCP client |
+   | `${clientIp}` | IP address of the MCP client |
+   | `${request_header:NAME}` | A header captured from the incoming MCP client request |
+
+2. **Policy injects the header** — a backend policy rule with `action: inject_argument`
+   references the effective header value via `${header:NAME}`:
+
+   ```yaml
+   # In a backend policy YAML:
+   rules:
+     - match: { tool: "^get_jira_issue$" }
+       action: inject_argument
+       inject:
+         caller_host: "${header:X-Client-Host}"
+         caller_ip: "${header:X-Client-IP}"
+   ```
+
+### Use cases
+
+- **Caller identity**: A compound sets `X-Client-Host: ${clientHost}` so the
+  backend knows which client made the call. The policy can inject it as a tool
+  argument for audit trails.
+- **Auth passthrough**: With `MCP_REQUEST_HEADER_CAPTURE=Authorization`, a
+  compound forwards the client's auth header to the backend:
+  `X-Forwarded-Auth: ${request_header:Authorization}`.
+- **Credential deduplication**: Headers defined once at the compound level
+  (or backend level) can be referenced in multiple policy inject rules without
+  repeating the secret.
+
+### Example
+
+```yaml
+# compounds.yaml
+compounds:
+  local:
+    path: /mcp/local
+    headers:
+      X-Client-Host: "${clientHost}"
+      X-Client-IP: "${clientIp}"
+      X-Forwarded-Auth: "${request_header:Authorization}"
+    backends: [skills, jira-mcp]
+
+# Backend policy (e.g. skills.yaml)
+rules:
+  - match: { tool: "^shell_exec$" }
+    action: inject_argument
+    inject:
+      caller_host: "${header:X-Client-Host}"
+      caller_ip: "${header:X-Client-IP}"
+```
 
 ## Development
 

@@ -103,8 +103,31 @@ class ClientInfo:
 # ContextVar holding per-request client info
 _client_info: contextvars.ContextVar[Optional[ClientInfo]] = contextvars.ContextVar("client_info", default=None)
 
+# ContextVar holding per-request effective HTTP headers for downstream backends.
+# Set by compound handlers (merged backend + compound headers). When unset,
+# forward() falls back to bc.headers. Policy inject rules can reference
+# these via ${header:NAME}.
+_request_headers: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar("request_headers", default=None)
+
+# ContextVar holding per-request incoming HTTP headers captured from the
+# MCP client's request. Compounds can reference these via ${request_header:NAME}
+# to dynamically forward client-supplied headers downstream.
+_incoming_headers: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar("incoming_headers", default=None)
+
 # DNS reverse lookup cache: ip -> hostname
 _dns_cache: Dict[str, str] = {}
+
+# Comma-separated list of incoming HTTP header names to capture from the MCP
+# client request. Captured headers are available for compound header resolution
+# via ${request_header:NAME}. This enables auth-passthrough: a compound can
+# forward the client's Authorization header (or any other header) to the
+# downstream backend dynamically per-request.
+# Example: MCP_REQUEST_HEADER_CAPTURE=Authorization,X-User-Email
+_REQUEST_HEADER_CAPTURE: List[str] = [
+    h.strip()
+    for h in os.environ.get("MCP_REQUEST_HEADER_CAPTURE", "").split(",")
+    if h.strip()
+]
 
 
 def _resolve_host(ip: str) -> str:
@@ -123,17 +146,39 @@ def _resolve_host(ip: str) -> str:
 
 
 class ClientInfoMiddleware(BaseHTTPMiddleware):
-    """Extracts client IP/Host from each request and stores in ContextVar."""
+    """Extracts client IP/Host and selected incoming request headers per request.
+
+    Stores in ContextVars:
+    - ``_client_info``: ClientInfo with ip and reverse-DNS host.
+    - ``_incoming_headers``: dict of captured incoming header name -> value,
+      for headers listed in ``MCP_REQUEST_HEADER_CAPTURE``.
+
+    The captured incoming headers can be referenced in compound configs via
+    ``${request_header:NAME}`` to dynamically forward client-supplied headers
+    to downstream backends.
+    """
 
     async def dispatch(self, request: Request, call_next):
         client = request.client
         ip = client.host if client else "0.0.0.0"
         host = _resolve_host(ip)
-        token = _client_info.set(ClientInfo(ip=ip, host=host))
+        ci_token = _client_info.set(ClientInfo(ip=ip, host=host))
+
+        # Capture selected incoming request headers for downstream use.
+        incoming = {}
+        if _REQUEST_HEADER_CAPTURE:
+            raw_headers = dict(request.headers)
+            for name in _REQUEST_HEADER_CAPTURE:
+                val = raw_headers.get(name) or raw_headers.get(name.lower())
+                if val is not None:
+                    incoming[name] = val
+        ih_token = _incoming_headers.set(incoming or None)
+
         try:
             response = await call_next(request)
         finally:
-            _client_info.reset(token)
+            _client_info.reset(ci_token)
+            _incoming_headers.reset(ih_token)
         return response
 
 
@@ -221,6 +266,13 @@ class CompoundConfig:
     # rebinding protection (required for browser origins like chrome-extension://
     # or http://localhost:<port> that aren't in the allowlist).
     allow_browser: bool = False
+    # headers: optional HTTP headers to send to downstream backends through
+    # this compound. These are merged with (and override) the backend's own
+    # headers. Values support ${env:VAR}, ${clientHost}, ${clientIp}, and
+    # ${request_header:NAME} templates, resolved per-request.
+    # Downstream policy inject rules can reference the effective header values
+    # via ${header:NAME} in inject_argument rules.
+    headers: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -637,6 +689,11 @@ def load_compounds(compounds_path: str, available_backends: Dict[str, BackendCon
             log.warning("Compound '%s': unknown schema '%s' (defaulting to 'full')", name, schema)
             schema = "full"
 
+        compound_headers = conf.get("headers")
+        if compound_headers is not None and not isinstance(compound_headers, dict):
+            log.warning("Compound '%s': 'headers' must be a mapping (ignoring)", name)
+            compound_headers = None
+
         compounds.append(CompoundConfig(
             name=name,
             path=path,
@@ -647,10 +704,12 @@ def load_compounds(compounds_path: str, available_backends: Dict[str, BackendCon
             cors=bool(conf.get("cors", False)),
             schema=schema,
             allow_browser=bool(conf.get("allow_browser", False)),
+            headers=compound_headers,
         ))
-        log.info("Loaded compound '%s' with backends: %s (cors=%s, schema=%s, allow_browser=%s)",
+        log.info("Loaded compound '%s' with backends: %s (cors=%s, schema=%s, allow_browser=%s, headers=%s)",
                  name, backend_names, bool(conf.get("cors", False)), schema,
-                 bool(conf.get("allow_browser", False)))
+                 bool(conf.get("allow_browser", False)),
+                 bool(compound_headers))
 
     return compounds
 
@@ -659,10 +718,51 @@ def load_compounds(compounds_path: str, available_backends: Dict[str, BackendCon
 # Template resolution
 # ---------------------------------------------------------------------------
 
+def _resolve_header_refs(value: Any, headers: Optional[Dict[str, str]] = None) -> Any:
+    """Resolve ${header:NAME} and ${request_header:NAME} template variables in a value.
+
+    ${header:NAME}         — value of header NAME from the effective downstream
+                             headers (compound + backend merged, via _request_headers
+                             ContextVar). Used in policy inject rules to reference
+                             header values set by the compound.
+    ${request_header:NAME} — value of header NAME from the incoming MCP client
+                             request headers (captured by ClientInfoMiddleware from
+                             MCP_REQUEST_HEADER_CAPTURE). Used in compound header
+                             values to dynamically forward client-supplied headers.
+
+    If the header is not found, the template reference is left unchanged.
+    Non-string values are returned as-is.
+    """
+    if not isinstance(value, str):
+        return value
+    if headers is None:
+        headers = _request_headers.get() or {}
+
+    def replacer(m):
+        key = m.group(1)
+        prefix, _, name = key.partition(":")
+        if prefix == "header":
+            return headers.get(name, m.group(0))
+        if prefix == "request_header":
+            incoming = _incoming_headers.get() or {}
+            return incoming.get(name, m.group(0))
+        return m.group(0)
+
+    return re.sub(r'\$\{([^}]+)\}', replacer, value)
+
+
 def resolve_template(template: str, tool_name: str, arguments: dict) -> str:
     def replacer(m):
         fp = m.group(1)
         if fp == "tool": return tool_name
+        if fp.startswith("header:"):
+            headers = _request_headers.get() or {}
+            name = fp[7:]
+            return headers.get(name, m.group(0))
+        if fp.startswith("request_header:"):
+            incoming = _incoming_headers.get() or {}
+            name = fp[15:]
+            return incoming.get(name, m.group(0))
         val = _get_nested(arguments, fp[5:] if fp.startswith("args.") else fp)
         return str(val) if val is not None else m.group(0)
     return re.sub(r'\$\{(.+?)\}', replacer, template)
@@ -681,18 +781,59 @@ def resolve_env_value(value: str) -> str:
 
 
 def resolve_injections(inject: dict) -> dict:
-    """Resolve injection values, replacing ${env:VAR} references with env vars.
+    """Resolve injection values, replacing template references.
+
+    Supports the following template variables in inject values:
+      ${env:VAR}            — environment variable lookup
+      ${header:NAME}        — effective downstream header value (compound +
+                              backend merged, via _request_headers ContextVar)
+      ${request_header:NAME} — incoming MCP client request header value
+                              (captured by ClientInfoMiddleware)
+      ${clientHost}          — reverse-DNS hostname of the calling client
+      ${clientIp}            — IP address of the calling client
 
     For example: {"sudoPassword": "${env:SUDO_PASSWORD}"}
             -> {"sudoPassword": "actual-secret-value"}
+
+    Or: {"callerHost": "${header:X-Client-Host}"}
+        -> {"callerHost": "the-value-of-X-Client-Host-header"}
     """
+    info = _client_info.get()
+    headers = _request_headers.get() or {}
     resolved = {}
     for key, value in inject.items():
         if isinstance(value, str):
-            resolved[key] = resolve_env_value(value)
+            value = resolve_env_value(value)
+            value = _resolve_header_refs(value, headers)
+            if info is not None:
+                value = value.replace("${clientHost}", info.host)
+                value = value.replace("${clientIp}", info.ip)
+            resolved[key] = value
         else:
             resolved[key] = value
     return resolved
+
+
+def _resolve_compound_header_value(value: Any, info: Optional[ClientInfo]) -> Any:
+    """Resolve template variables in a compound header value.
+
+    Supports: ${env:VAR}, ${clientHost}, ${clientIp}, ${request_header:NAME}.
+    Does NOT support ${header:NAME} (would be circular — the header values
+    are being computed right now).
+    """
+    if not isinstance(value, str):
+        return value
+    value = resolve_env_value(value)
+    # Resolve ${request_header:NAME} from incoming request headers.
+    # Pass headers=None so _resolve_header_refs reads from _request_headers
+    # (which is not yet set during compound header computation) — but since we
+    # only need request_header refs here, pass an empty dict to avoid
+    # any ${header:NAME} resolution.
+    value = _resolve_header_refs(value, {})
+    if info is not None:
+        value = value.replace("${clientHost}", info.host)
+        value = value.replace("${clientIp}", info.ip)
+    return value
 
 
 def _get_nested(d: dict, key: str) -> Any:
@@ -773,7 +914,13 @@ async def discover_from_backend(bc) -> Tuple[List, Optional[str]]:
 async def forward(bc, tool_name, arguments):
     try:
         if _is_http(bc):
-            headers = bc.headers if isinstance(bc, BackendConfig) else bc.get("headers")
+            # Use per-request effective headers if set (by compound handlers),
+            # otherwise fall back to the backend's static headers.
+            ctx_headers = _request_headers.get()
+            if ctx_headers:
+                headers = ctx_headers
+            else:
+                headers = bc.headers if isinstance(bc, BackendConfig) else bc.get("headers")
             async with streamablehttp_client(bc.url, headers=headers) as (r, w, _):
                 async with ClientSession(r, w) as s:
                     await s.initialize()
@@ -1229,49 +1376,67 @@ async def create_compound_server(compound: CompoundConfig,
                         policy_kw.setdefault("clientHost", info.host)
                         policy_kw.setdefault("clientIp", info.ip)
 
-                    # Check policy rules
-                    injections = {}
-                    for rule in backend_rules:
-                        if matches_rule(rule, original_name, policy_kw):
-                            action = rule.get("action", "deny")
+                    # --- Compute effective headers for downstream backend ---
+                    # Merge backend headers with compound headers (compound wins).
+                    # Resolve per-request templates in compound headers:
+                    # ${env:VAR}, ${clientHost}, ${clientIp}, ${request_header:NAME}.
+                    effective_headers = dict(backend_cfg.headers or {})
+                    if compound.headers:
+                        for hk, hv in compound.headers.items():
+                            effective_headers[hk] = _resolve_compound_header_value(hv, info)
 
-                            if action == "deny":
-                                reason = resolve_template(
-                                    rule.get("reason", backend_cfg.default_deny),
-                                    original_name, policy_kw
-                                )
-                                log.warning("Tool call %s.%s DENIED: %s (args=%s)",
-                                            backend_cfg.name, original_name, reason, _sanitize_args(policy_kw))
-                                return f"ACCESS DENIED: {reason}"
+                    # Set per-request effective headers so forward() sends them
+                    # to the backend and policy inject rules can reference them
+                    # via ${header:NAME}. The ContextVar is inherited by any
+                    # delegated make_policy_handler (e.g. confirm action), so
+                    # those forward() calls also use the compound's headers.
+                    hh_token = _request_headers.set(effective_headers)
+                    try:
+                        # Check policy rules
+                        injections = {}
+                        for rule in backend_rules:
+                            if matches_rule(rule, original_name, policy_kw):
+                                action = rule.get("action", "deny")
 
-                            elif action == "inject_argument":
-                                injections.update(resolve_injections(rule.get("inject", {})))
-                                break
+                                if action == "deny":
+                                    reason = resolve_template(
+                                        rule.get("reason", backend_cfg.default_deny),
+                                        original_name, policy_kw
+                                    )
+                                    log.warning("Tool call %s.%s DENIED: %s (args=%s)",
+                                                backend_cfg.name, original_name, reason, _sanitize_args(policy_kw))
+                                    return f"ACCESS DENIED: {reason}"
 
-                            elif action == "confirm":
-                                # Confirm action - delegate to backend handler
-                                compound_handler = make_policy_handler(
-                                    backend_cfg, backend_rules, original_name, backend_st
-                                )
-                                return await compound_handler(**kw)
+                                elif action == "inject_argument":
+                                    injections.update(resolve_injections(rule.get("inject", {})))
+                                    break
 
-                            else:
-                                break
+                                elif action == "confirm":
+                                    # Confirm action - delegate to backend handler
+                                    compound_handler = make_policy_handler(
+                                        backend_cfg, backend_rules, original_name, backend_st
+                                    )
+                                    return await compound_handler(**kw)
 
-                    # Apply injections
-                    if injections:
-                        kw = {**kw, **injections}
+                                else:
+                                    break
 
-                    # Forward to backend
-                    result = await forward(backend_cfg, original_name, kw)
-                    if "error" in result:
-                        log.error("Tool call %s.%s FAILED: %s (args=%s)",
-                                  backend_cfg.name, original_name, result["error"], _sanitize_args(policy_kw))
-                        return f"Error: {result['error']}"
-                    out = result.get("content", [""])[0]
-                    log.info("Tool call %s.%s OK (args=%s) -> %s",
-                             backend_cfg.name, original_name, _sanitize_args(policy_kw), _preview(out))
-                    return out
+                        # Apply injections
+                        if injections:
+                            kw = {**kw, **injections}
+
+                        # Forward to backend
+                        result = await forward(backend_cfg, original_name, kw)
+                        if "error" in result:
+                            log.error("Tool call %s.%s FAILED: %s (args=%s)",
+                                      backend_cfg.name, original_name, result["error"], _sanitize_args(policy_kw))
+                            return f"Error: {result['error']}"
+                        out = result.get("content", [""])[0]
+                        log.info("Tool call %s.%s OK (args=%s) -> %s",
+                                 backend_cfg.name, original_name, _sanitize_args(policy_kw), _preview(out))
+                        return out
+                    finally:
+                        _request_headers.reset(hh_token)
 
                 return handler
 

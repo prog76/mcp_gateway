@@ -234,3 +234,235 @@ def test_start_main_entrypoint_registered():
     matching = [ep for ep in ep_list if ep.name == "mcp-gateway-start"]
     assert matching, "mcp-gateway-start console script not registered"
     assert matching[0].value == "gateway.start:main"
+
+
+# ---------------------------------------------------------------------------
+# Compound headers: tests for the new compound-level HTTP header feature
+# ---------------------------------------------------------------------------
+
+def test_compound_config_has_headers():
+    """CompoundConfig supports a headers field (defaults to None)."""
+    cc = policy_proxy.CompoundConfig(
+        name="test",
+        path="/mcp/test",
+        backends=["backend1"],
+        headers={"X-Custom": "value"},
+    )
+    assert cc.headers == {"X-Custom": "value"}
+
+    # Default is None
+    cc2 = policy_proxy.CompoundConfig(
+        name="test2",
+        path="/mcp/test2",
+        backends=[],
+    )
+    assert cc2.headers is None
+
+
+def test_load_compounds_with_headers(tmp_path):
+    """load_compounds parses headers from YAML config."""
+    compounds_file = tmp_path / "compounds.yaml"
+    compounds_file.write_text(
+        """\
+compounds:
+  test:
+    path: /mcp/test
+    backends: [backend1]
+    headers:
+      X-Dynamic: "value-${env:TEST_VAR}"
+      X-Host: "${clientHost}"
+"""
+    )
+    os.environ["TEST_VAR"] = "resolved"
+    try:
+        available = {"backend1": policy_proxy.BackendConfig(name="backend1", url="http://localhost:9999")}
+        compounds = policy_proxy.load_compounds(str(compounds_file), available)
+        assert len(compounds) == 1
+        assert compounds[0].headers == {
+            "X-Dynamic": "value-${env:TEST_VAR}",
+            "X-Host": "${clientHost}",
+        }
+    finally:
+        os.environ.pop("TEST_VAR", None)
+
+
+def test_load_compounds_headers_type_validation(tmp_path):
+    """load_compounds rejects non-mapping headers and warns."""
+    compounds_file = tmp_path / "compounds.yaml"
+    compounds_file.write_text(
+        """\
+compounds:
+  test:
+    path: /mcp/test
+    backends: [backend1]
+    headers: "not-a-mapping"
+"""
+    )
+    available = {"backend1": policy_proxy.BackendConfig(name="backend1", url="http://localhost:9999")}
+    compounds = policy_proxy.load_compounds(str(compounds_file), available)
+    assert len(compounds) == 1
+    assert compounds[0].headers is None
+
+
+def test_load_compounds_no_headers():
+    """Compounds without headers field get headers=None (backward compat)."""
+    cc = policy_proxy.CompoundConfig(name="x", path="/mcp/x", backends=[])
+    assert cc.headers is None
+
+
+def test_resolve_header_refs():
+    """_resolve_header_refs resolves ${header:NAME} and ${request_header:NAME}."""
+    hr_token = policy_proxy._request_headers.set({
+        "X-Client-Host": "my-host",
+        "X-Token": "secret123",
+    })
+    ih_token = policy_proxy._incoming_headers.set({"Authorization": "Bearer abc123"})
+    try:
+        # ${header:NAME} from _request_headers
+        assert policy_proxy._resolve_header_refs("${header:X-Token}") == "secret123"
+
+        # ${request_header:NAME} from _incoming_headers
+        assert policy_proxy._resolve_header_refs("${request_header:Authorization}") == "Bearer abc123"
+
+        # Missing header leaves template unchanged
+        assert policy_proxy._resolve_header_refs("${header:Nonexistent}") == "${header:Nonexistent}"
+
+        # Multiple refs in one string
+        result = policy_proxy._resolve_header_refs(
+            "${header:X-Client-Host} sent ${request_header:Authorization}"
+        )
+        assert result == "my-host sent Bearer abc123"
+
+        # Non-string values pass through
+        assert policy_proxy._resolve_header_refs(42) == 42
+
+        # None (empty ContextVar) → empty headers, template left unchanged
+        hr_token2 = policy_proxy._request_headers.set(None)
+        try:
+            assert policy_proxy._resolve_header_refs("${header:X-Token}") == "${header:X-Token}"
+        finally:
+            policy_proxy._request_headers.reset(hr_token2)
+    finally:
+        policy_proxy._request_headers.reset(hr_token)
+        policy_proxy._incoming_headers.reset(ih_token)
+
+
+def test_resolve_template_with_header():
+    """resolve_template supports ${header:NAME} and ${request_header:NAME}."""
+    hr_token = policy_proxy._request_headers.set({"X-User": "bob"})
+    ih_token = policy_proxy._incoming_headers.set({"X-Original-Auth": "Bearer xyz"})
+    try:
+        assert policy_proxy.resolve_template("Hello ${header:X-User}", "tool_name", {}) == "Hello bob"
+        assert policy_proxy.resolve_template(
+            "Auth: ${request_header:X-Original-Auth}", "tool_name", {}
+        ) == "Auth: Bearer xyz"
+        # Unknown header leaves template unchanged
+        assert policy_proxy.resolve_template(
+            "Val: ${header:Missing}", "tool_name", {}
+        ) == "Val: ${header:Missing}"
+    finally:
+        policy_proxy._request_headers.reset(hr_token)
+        policy_proxy._incoming_headers.reset(ih_token)
+
+
+def test_resolve_injections_with_headers():
+    """resolve_injections supports ${header:NAME} from _request_headers."""
+    hr_token = policy_proxy._request_headers.set({"X-User-ID": "user42"})
+    try:
+        result = policy_proxy.resolve_injections({"user": "${header:X-User-ID}"})
+        assert result["user"] == "user42"
+    finally:
+        policy_proxy._request_headers.reset(hr_token)
+
+
+def test_resolve_injections_with_request_header():
+    """resolve_injections supports ${request_header:NAME} from _incoming_headers."""
+    ih_token = policy_proxy._incoming_headers.set({"Authorization": "Bearer token123"})
+    try:
+        result = policy_proxy.resolve_injections({"auth": "${request_header:Authorization}"})
+        assert result["auth"] == "Bearer token123"
+    finally:
+        policy_proxy._incoming_headers.reset(ih_token)
+
+
+def test_resolve_injections_with_client_info():
+    """resolve_injections supports ${clientHost} and ${clientIp}."""
+    ci_token = policy_proxy._client_info.set(
+        policy_proxy.ClientInfo(ip="192.168.1.1", host="myhost")
+    )
+    try:
+        result = policy_proxy.resolve_injections({
+            "host": "${clientHost}",
+            "ip": "${clientIp}",
+        })
+        assert result["host"] == "myhost"
+        assert result["ip"] == "192.168.1.1"
+    finally:
+        policy_proxy._client_info.reset(ci_token)
+
+
+def test_resolve_injections_env_still_works():
+    """resolve_injections still resolves ${env:VAR} (backward compat)."""
+    os.environ["MCP_TEST_INJECT_ENV"] = "env_value"
+    try:
+        result = policy_proxy.resolve_injections({"var": "${env:MCP_TEST_INJECT_ENV}"})
+        assert result["var"] == "env_value"
+    finally:
+        os.environ.pop("MCP_TEST_INJECT_ENV", None)
+
+
+def test_resolve_compound_header_value():
+    """_resolve_compound_header_value resolves ${env:VAR}, ${clientHost},
+    ${clientIp}, and ${request_header:NAME} — but NOT ${header:NAME}
+    (would be circular)."""
+    os.environ["TEST_COMPOUND_VAR"] = "env-value"
+    ci_token = policy_proxy._client_info.set(
+        policy_proxy.ClientInfo(ip="10.0.0.1", host="client.example.com")
+    )
+    ih_token = policy_proxy._incoming_headers.set({"Authorization": "Bearer xyz"})
+    try:
+        info = policy_proxy._client_info.get()
+        # Env var
+        assert policy_proxy._resolve_compound_header_value("${env:TEST_COMPOUND_VAR}", info) == "env-value"
+        # Client host
+        assert policy_proxy._resolve_compound_header_value("${clientHost}", info) == "client.example.com"
+        # Client IP
+        assert policy_proxy._resolve_compound_header_value("${clientIp}", info) == "10.0.0.1"
+        # Request header (from incoming MCP client request)
+        assert policy_proxy._resolve_compound_header_value(
+            "${request_header:Authorization}", info
+        ) == "Bearer xyz"
+        # ${header:NAME} is NOT resolved (would be circular) — left unchanged
+        assert policy_proxy._resolve_compound_header_value(
+            "${header:SomeHeader}", info
+        ) == "${header:SomeHeader}"
+        # Non-string values pass through
+        assert policy_proxy._resolve_compound_header_value(42, info) == 42
+    finally:
+        policy_proxy._client_info.reset(ci_token)
+        policy_proxy._incoming_headers.reset(ih_token)
+        os.environ.pop("TEST_COMPOUND_VAR", None)
+
+
+def test_resolve_injections_no_context_vars():
+    """resolve_injections works with no ContextVars set (backward compat)."""
+    # Ensure ContextVars are reset to default
+    hr_token = policy_proxy._request_headers.set(None)
+    ih_token = policy_proxy._incoming_headers.set(None)
+    ci_token = policy_proxy._client_info.set(None)
+    try:
+        # ${header:NAME} unresolved, ${env:VAR} still works
+        os.environ["MCP_TEST_NO_CTX"] = "val"
+        try:
+            result = policy_proxy.resolve_injections({
+                "from_header": "${header:Missing}",
+                "from_env": "${env:MCP_TEST_NO_CTX}",
+            })
+            assert result["from_header"] == "${header:Missing}"
+            assert result["from_env"] == "val"
+        finally:
+            os.environ.pop("MCP_TEST_NO_CTX", None)
+    finally:
+        policy_proxy._request_headers.reset(hr_token)
+        policy_proxy._incoming_headers.reset(ih_token)
+        policy_proxy._client_info.reset(ci_token)
