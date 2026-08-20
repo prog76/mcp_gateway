@@ -12,7 +12,6 @@ license = { text = "MIT" }
 repository = "https://github.com/prog76/mcp_gateway"
 dependencies = [
     "mcp2cli @ git+https://github.com/prog76/mcp_mcp2cli.git",
-    "skills-server @ git+https://github.com/prog76/mcp_skills-server.git",
     "mcp>=1.0.0",
     "fastmcp>=2.0.0",
     "jsonschema>=4.0.0",
@@ -31,11 +30,7 @@ mcp-gateway-start = "gateway.start:main"
 Homepage = "https://github.com/prog76/mcp_gateway"
 Documentation = "https://github.com/prog76/mcp_gateway#readme"
 "mcp2cli upstream" = "https://github.com/prog76/mcp_mcp2cli"
-"skills-server upstream" = "https://github.com/prog76/mcp_skills-server"
 
-# Allow direct (git/URL) references in project.dependencies, e.g.
-#   mcp2cli @ git+https://github.com/prog76/mcp_mcp2cli.git
-#   skills-server @ git+https://github.com/prog76/mcp_skills-server.git
 [tool.hatch.metadata]
 allow-direct-references = true
 

@@ -14,7 +14,7 @@ Supports both:
 import asyncio
 import contextlib
 import logging
-from typing import Optional, List, Callable
+from typing import Any, Optional, List, Callable, Awaitable
 
 import anyio
 from starlette.applications import Starlette
@@ -62,6 +62,8 @@ class MountedServer:
         prompts: Optional[dict[str, str]] = None,
         strip_output_schema: bool = False,
         stateless: bool = False,
+        prompt_resolver: Optional[Callable[[str], Awaitable[str]]] = None,
+        prompt_proxy: Optional[Callable[[str, Optional[str]], Awaitable]] = None,
     ):
         self.name = name
         self.port = port
@@ -69,6 +71,19 @@ class MountedServer:
         self._tools: List[Tool] = []
         self._tool_handlers: dict[str, Callable] = {}
         self._prompts: dict[str, str] = prompts or {}
+        # Optional async callable that resolves template variables (e.g.
+        # {{ mcp_call('tool_name') }}) in prompt text before it is returned
+        # to the client.  When None, the prompt text is returned verbatim.
+        self._prompt_resolver = prompt_resolver
+        # Optional async callable that proxies prompt requests (list/get) to a
+        # downstream backend.  Signature: (kind: "list"|"get", name:
+        # Optional[str]) -> list[Prompt] | GetPromptResult | None.  When set,
+        # prompts/list and prompts/get are delegated to the proxy instead of
+        # the static self._prompts / self._prompt_resolver path.
+        self._prompt_proxy = prompt_proxy
+        # When True, the prompt proxy is the exclusive handler; the static
+        # self._prompts path is unused.
+        self._use_prompt_proxy = prompt_proxy is not None
         # When True, tools are advertised without an outputSchema (equivalent to
         # vscode-mcp's structured_output=False). Some browser-based MCP clients
         # (e.g. mcp super-assistant) fail on structured output schemas.
@@ -123,9 +138,12 @@ class MountedServer:
         # ------------------------------------------------------------
         # Prompts / prompt templates
         # ------------------------------------------------------------
-        if self._prompts:
+        if self._prompts or self._use_prompt_proxy:
             @self._mcp.list_prompts()
             async def list_prompts(req: types.ListPromptsRequest) -> types.ListPromptsResult:
+                if self._use_prompt_proxy and self._prompt_proxy is not None:
+                    prompts = await self._prompt_proxy("list", None)
+                    return types.ListPromptsResult(prompts=prompts or [])
                 # Only return the prompts we were configured with.
                 return types.ListPromptsResult(
                     prompts=[
@@ -136,10 +154,21 @@ class MountedServer:
 
             @self._mcp.get_prompt()
             async def get_prompt(name: str, arguments: dict[str, str] | None = None) -> types.GetPromptResult:
-                # `arguments` is currently unused (no templating in bootstrap prompt).
+                if self._use_prompt_proxy and self._prompt_proxy is not None:
+                    result = await self._prompt_proxy("get", name)
+                    if result is None:
+                        raise ValueError(f"Unknown prompt: {name}")
+                    return result
+                # Resolve {{ mcp_call('tool_name') }} templates in the prompt
+                # text by calling the referenced MCP tool at request time.
                 if name not in self._prompts:
                     raise ValueError(f"Unknown prompt: {name}")
                 prompt_text = self._prompts[name]
+                if self._prompt_resolver is not None:
+                    try:
+                        prompt_text = await self._prompt_resolver(prompt_text)
+                    except Exception as e:
+                        log.error("prompt_resolver error for prompt '%s': %s", name, e, exc_info=True)
                 return types.GetPromptResult(
                     description=f"Prompt: {name}",
                     messages=[
@@ -190,9 +219,12 @@ class MountedServer:
 
                 # Prompts support (bootstrap prompts) for legacy clients.
                 # Without these handlers, Cline can call `prompts/list`, but receives an empty set.
-                if self._prompts:
+                if self._prompts or self._use_prompt_proxy:
                     @server.list_prompts()
                     async def list_prompts_sse(req: types.ListPromptsRequest) -> types.ListPromptsResult:
+                        if self._use_prompt_proxy and self._prompt_proxy is not None:
+                            prompts = await self._prompt_proxy("list", None)
+                            return types.ListPromptsResult(prompts=prompts or [])
                         return types.ListPromptsResult(
                             prompts=[
                                 types.Prompt(name=prompt_name, description="Bootstrap prompt")
@@ -205,9 +237,21 @@ class MountedServer:
                         name: str,
                         arguments: dict[str, str] | None = None,
                     ) -> types.GetPromptResult:
+                        if self._use_prompt_proxy and self._prompt_proxy is not None:
+                            result = await self._prompt_proxy("get", name)
+                            if result is None:
+                                raise ValueError(f"Unknown prompt: {name}")
+                            return result
                         if name not in self._prompts:
                             raise ValueError(f"Unknown prompt: {name}")
                         prompt_text = self._prompts[name]
+                        # Resolve {{ mcp_call('tool_name') }} templates for
+                        # legacy SSE clients too.
+                        if self._prompt_resolver is not None:
+                            try:
+                                prompt_text = await self._prompt_resolver(prompt_text)
+                            except Exception as e:
+                                log.error("prompt_resolver error for prompt '%s': %s", name, e, exc_info=True)
                         return types.GetPromptResult(
                             description=f"Prompt: {name}",
                             messages=[

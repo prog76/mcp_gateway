@@ -792,6 +792,10 @@ def resolve_injections(inject: dict) -> dict:
       ${clientHost}          — reverse-DNS hostname of the calling client
       ${clientIp}            — IP address of the calling client
 
+    Nested dicts (e.g. ``kernel_env``) are resolved recursively, so
+    ``{"kernel_env": {"MCP_ENDPOINT": "${header:X-MCP-Endpoint}"}}``
+    resolves the inner value too.
+
     For example: {"sudoPassword": "${env:SUDO_PASSWORD}"}
             -> {"sudoPassword": "actual-secret-value"}
 
@@ -800,18 +804,22 @@ def resolve_injections(inject: dict) -> dict:
     """
     info = _client_info.get()
     headers = _request_headers.get() or {}
-    resolved = {}
-    for key, value in inject.items():
+
+    def _resolve_value(value):
         if isinstance(value, str):
             value = resolve_env_value(value)
             value = _resolve_header_refs(value, headers)
             if info is not None:
                 value = value.replace("${clientHost}", info.host)
                 value = value.replace("${clientIp}", info.ip)
-            resolved[key] = value
-        else:
-            resolved[key] = value
-    return resolved
+            return value
+        if isinstance(value, dict):
+            return {k: _resolve_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_resolve_value(v) for v in value]
+        return value
+
+    return {key: _resolve_value(value) for key, value in inject.items()}
 
 
 def _resolve_compound_header_value(value: Any, info: Optional[ClientInfo]) -> Any:
@@ -849,9 +857,101 @@ def _get_nested(d: dict, key: str) -> Any:
     return d
 
 
+# Regex matching {{ mcp_call('tool_name') }} and {{ mcp_call("tool_name") }}
+_MCP_CALL_RE = re.compile(r"\{\{\s*mcp_call\(['\"]([^'\"]+)['\"]\)\s*\}\}")
+
+
+async def _call_mcp_from_compound(tool_name: str, compound: "CompoundConfig",
+                                  backend_status_map: Dict[str, "BackendStatus"]) -> str:
+    """Resolve a single {{ mcp_call('tool_name') }} by calling the MCP tool.
+
+    The *tool_name* uses the compound-prefixed form (e.g.
+    ``ipybox_list_skills``).  This function finds the backend that owns the
+    tool, strips the prefix, and forwards the call via :func:`forward`.
+
+    Returns the tool's text result (first content item) or an error string
+    if the tool/backend is unavailable.
+    """
+    # Find the backend that provides this tool by checking the compound's
+    # backends.  Each backend's registered tools are prefixed with
+    # ``{backend_name}_``.
+    for backend_name in compound.backends:
+        if backend_name not in backend_status_map:
+            continue
+        status = backend_status_map[backend_name]
+        if not status.healthy:
+            continue
+        prefix = f"{backend_name}_"
+        if tool_name.startswith(prefix):
+            original_name = tool_name[len(prefix):]
+            bc = status.config
+            # Set up per-request effective headers so forward() sends the
+            # compound's headers to the backend (same logic as compound
+            # tool handlers).
+            info = _client_info.get()
+            effective_headers = dict(bc.headers or {})
+            if compound.headers:
+                for hk, hv in compound.headers.items():
+                    effective_headers[hk] = _resolve_compound_header_value(hv, info)
+            hh_token = _request_headers.set(effective_headers)
+            try:
+                result = await forward(bc, original_name, {})
+                if "error" in result:
+                    log.error("mcp_call '%s' failed: %s", tool_name, result["error"])
+                    return f"[mcp_call error for '{tool_name}': {result['error']}]"
+                if result.get("isError") and result.get("content"):
+                    err_text = result["content"][0]
+                    log.error("mcp_call '%s' failed: %s", tool_name, err_text)
+                    return f"[mcp_call error for '{tool_name}': {err_text}]"
+                content = result.get("content", [""])
+                text = content[0] if content else ""
+                return text
+            except Exception as e:
+                log.error("mcp_call '%s' exception: %s", tool_name, e, exc_info=True)
+                return f"[mcp_call error for '{tool_name}': {e}]"
+            finally:
+                _request_headers.reset(hh_token)
+    return f"[mcp_call error: tool '{tool_name}' not found on any backend in compound '{compound.name}']"
+
+
+async def resolve_mcp_call_templates(
+    prompt_text: str,
+    compound: "CompoundConfig",
+    backend_status_map: Dict[str, "BackendStatus"],
+) -> str:
+    """Resolve ``{{ mcp_call('tool_name') }}`` templates in prompt text.
+
+    For each ``mcp_call`` invocation, the function:
+      1. Finds which backend in *compound* provides the (prefixed) tool name.
+      2. Strips the backend prefix to get the original tool name.
+      3. Calls the tool via :func:`forward` with the compound's effective
+         headers set in the per-request ``_request_headers`` ContextVar.
+      4. Substitutes the tool's text result into the prompt text.
+
+    If no templates are present the text is returned unchanged.  If a tool
+    call fails, an error string is substituted so the prompt remains usable.
+    """
+    if not prompt_text or not _MCP_CALL_RE.search(prompt_text):
+        return prompt_text
+
+    matches = list(_MCP_CALL_RE.finditer(prompt_text))
+    parts: List[str] = []
+    last_end = 0
+    for match in matches:
+        parts.append(prompt_text[last_end:match.start()])
+        tool_name = match.group(1)
+        result_text = await _call_mcp_from_compound(tool_name, compound, backend_status_map)
+        parts.append(result_text)
+        last_end = match.end()
+    parts.append(prompt_text[last_end:])
+    return "".join(parts)
+
+
 def matches_rule(rule: dict, tool_name: str, arguments: dict) -> bool:
     spec = rule.get("match", {})
+
     if not re.search(spec.get("tool", ".*"), tool_name): return False
+
     for fp, rx in spec.items():
         if fp == "tool": continue
         val = _get_nested(arguments, fp)
@@ -941,6 +1041,51 @@ async def forward(bc, tool_name, arguments):
         # Prefer the concrete tool/backend message over ExceptionGroup/TaskGroup wrappers
         # so agents see e.g. "Terminal 'bash' is busy..." instead of junk.
         return {"content": [msg], "isError": True}
+
+
+async def forward_prompts(bc, kind: str, name: Optional[str] = None):
+    """Proxy prompts/list and prompts/get to a backend.
+
+    Mirrors forward()'s session pattern (streamablehttp_client/stdio_client
+    + ClientSession.initialize()).  kind is "list" or "get".
+
+    Returns:
+      - kind="list": list of mcp.types.Prompt objects
+      - kind="get":  the GetPromptResult (or None if the backend has no
+                     such prompt)
+    """
+    try:
+        if _is_http(bc):
+            ctx_headers = _request_headers.get()
+            if ctx_headers:
+                headers = ctx_headers
+            else:
+                headers = bc.headers if isinstance(bc, BackendConfig) else bc.get("headers")
+            async with streamablehttp_client(bc.url, headers=headers) as (r, w, _):
+                async with ClientSession(r, w) as s:
+                    await s.initialize()
+                    if kind == "list":
+                        res = await s.list_prompts()
+                        return list(res.prompts)
+                    elif kind == "get":
+                        res = await s.get_prompt(name)
+                        return res
+                    return []
+        elif _is_stdio(bc):
+            async with stdio_client(_build_stdio_params(bc)) as (r, w):
+                async with ClientSession(r, w) as s:
+                    await s.initialize()
+                    if kind == "list":
+                        res = await s.list_prompts()
+                        return list(res.prompts)
+                    elif kind == "get":
+                        res = await s.get_prompt(name)
+                        return res
+                    return []
+        return []
+    except Exception as e:
+        log.error("Backend %s prompt %s error: %s", bc.name, kind, e, exc_info=True)
+        return [] if kind == "list" else None
 
 
 def _extract_mcp_error_message(exc: BaseException) -> str:
@@ -1274,9 +1419,57 @@ async def create_compound_server(compound: CompoundConfig,
     Returns:
         Tuple of (MountedServer, CompoundStatus)
     """
-    prompts = {}
-    if compound.bootstrap_prompt_name and compound.bootstrap_prompt_text:
-        prompts[compound.bootstrap_prompt_name] = compound.bootstrap_prompt_text
+    # Build an async closure that proxies prompts/list + prompts/get to the
+    # compound's backends.  For "list", prompts from all healthy backends are
+    # merged (deduped by name).  For "get", the first healthy backend that
+    # has the named prompt is used.  The backend's effective headers
+    # (compound + backend merged, per-request resolved) are set in the
+    # _request_headers ContextVar so forward_prompts sends them to the
+    # backend — mirroring _call_mcp_from_compound.
+    async def prompt_proxy(kind: str, name: Optional[str] = None):
+        if kind == "list":
+            seen = set()
+            combined = []
+            for backend_name in compound.backends:
+                status = backend_status_map.get(backend_name)
+                if status is None or not status.healthy:
+                    continue
+                bc = status.config
+                info = _client_info.get()
+                effective_headers = dict(bc.headers or {})
+                if compound.headers:
+                    for hk, hv in compound.headers.items():
+                        effective_headers[hk] = _resolve_compound_header_value(hv, info)
+                hh_token = _request_headers.set(effective_headers)
+                try:
+                    prompts_list = await forward_prompts(bc, "list")
+                finally:
+                    _request_headers.reset(hh_token)
+                for p in prompts_list:
+                    if p.name not in seen:
+                        seen.add(p.name)
+                        combined.append(p)
+            return combined
+        elif kind == "get":
+            for backend_name in compound.backends:
+                status = backend_status_map.get(backend_name)
+                if status is None or not status.healthy:
+                    continue
+                bc = status.config
+                info = _client_info.get()
+                effective_headers = dict(bc.headers or {})
+                if compound.headers:
+                    for hk, hv in compound.headers.items():
+                        effective_headers[hk] = _resolve_compound_header_value(hv, info)
+                hh_token = _request_headers.set(effective_headers)
+                try:
+                    result = await forward_prompts(bc, "get", name)
+                finally:
+                    _request_headers.reset(hh_token)
+                if result is not None:
+                    return result
+            return None
+        return [] if kind == "list" else None
 
     # Browser-facing features:
     # - schema 'minimal' strips outputSchema (like vscode-mcp structured_output=False)
@@ -1291,11 +1484,12 @@ async def create_compound_server(compound: CompoundConfig,
             name=compound.name,
             port=http_port,
             allowed_hosts=allowed_hosts,
-            prompts=prompts if prompts else None,
+            prompt_proxy=prompt_proxy,
             strip_output_schema=strip_output_schema,
             enable_dns_rebinding_protection=False,
             stateless=True,
         )
+
         compound_status = CompoundStatus(
             name=compound.name,
             path=compound.path,
@@ -1308,7 +1502,7 @@ async def create_compound_server(compound: CompoundConfig,
             name=compound.name,
             port=http_port,
             allowed_hosts=allowed_hosts,
-            prompts=prompts if prompts else None,
+            prompt_proxy=prompt_proxy,
             strip_output_schema=strip_output_schema,
             enable_dns_rebinding_protection=not compound.allow_browser,
         )
@@ -1512,7 +1706,12 @@ async def main():
 
         for bc, rules in backends:
             path = bc.path or f"/mcp/{bc.name}"
-            server = MountedServer(name=bc.name, port=http_port, allowed_hosts=allowed_hosts)
+            server = MountedServer(
+                name=bc.name,
+                port=http_port,
+                allowed_hosts=allowed_hosts,
+                prompt_proxy=lambda k, n: forward_prompts(bc, k, n),
+            )
 
             status = BackendStatus(
                 name=bc.name,

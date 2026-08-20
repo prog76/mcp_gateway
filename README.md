@@ -3,8 +3,8 @@
 MCP policy proxy with enforcement + compound endpoints.
 
 Adapted from the original `policy-proxy/mcp` package for distribution as an
-independent pip package. Depends on `mcp2cli` and `skills-server` (via pip)
-for the shared MCP client library and the skills MCP server.
+independent pip package. Depends on `mcp2cli` (via pip) for the shared MCP
+client library.
 
 ## What this package provides
 
@@ -25,9 +25,10 @@ for the shared MCP client library and the skills MCP server.
 mcp-gateway-start
 ```
 
-This starts the background MCP servers (k8s, netbox, foxmcp, skills) and then
+This starts the background MCP servers (k8s, netbox, foxmcp, ipybox) and then
 runs the policy proxy in the foreground — the same behavior as the original
-`start.sh`.
+`start.sh`. The exec backend is a stdio MCP server spawned on-demand by the
+proxy.
 
 ## Environment variables
 
@@ -101,11 +102,11 @@ compounds:
       X-Client-Host: "${clientHost}"
       X-Client-IP: "${clientIp}"
       X-Forwarded-Auth: "${request_header:Authorization}"
-    backends: [skills, jira-mcp]
+    backends: [ipybox, exec]
 
-# Backend policy (e.g. skills.yaml)
+# Backend policy (e.g. exec.yaml)
 rules:
-  - match: { tool: "^shell_exec$" }
+  - match: { tool: "^run$" }
     action: inject_argument
     inject:
       caller_host: "${header:X-Client-Host}"

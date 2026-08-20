@@ -2,15 +2,20 @@
 """
 gateway.start — Container entrypoint that reproduces start.sh behavior.
 
-Starts the background MCP server processes (k8s, netbox, foxmcp, skills), then
-runs the policy proxy in the foreground:
+Starts the background MCP server processes (k8s, netbox, foxmcp, ipybox),
+then runs the policy proxy in the foreground:
 
   1. Read env vars (POLICY_DIR, KUBECONFIG_PATH, POLICY_PROXY_PORT, ...)
   2. Validate policies if a VALIDATE_POLICY_PATH file is present
-  3. Start background MCP servers (skills via the `skills-server` console
-     script from the skills-server pip package)
+  3. Start background MCP servers (ipybox via HTTP; exec via stdio is
+     spawned on-demand by policy_proxy)
   4. Run a watchdog that restarts dead background servers
   5. Start the policy proxy (foreground) via ``gateway.policy_proxy.main()``
+
+Note: the exec backend (gateway.gateway.exec_mcp_server) is a stdio MCP
+server that the policy_proxy spawns as a child process — it does not need
+a background server entry.  ipybox is an HTTP MCP server from a separate
+container (configured via docker-compose).
 """
 
 from __future__ import annotations
@@ -33,7 +38,13 @@ def _env(key: str, default: str) -> str:
 
 
 def _build_mcp_servers(kubeconfig_path: str) -> List[Dict[str, str]]:
-    """Build the list of background MCP servers (name/port/cmd/args)."""
+    """Build the list of background MCP servers (name/port/cmd/args).
+
+    The exec backend is a stdio server spawned on-demand by policy_proxy
+    (see config/policy/real/exec.yaml with transport: stdio), so it does
+    NOT appear here.  ipybox is expected to be a separate container
+    (http://ipybox:9006).
+    """
     servers = []
     python = sys.executable
 
@@ -64,14 +75,18 @@ def _build_mcp_servers(kubeconfig_path: str) -> List[Dict[str, str]]:
         "args": ["-m", "gateway.foxmcp_server", "--mcp-port", "9005", "--ws-port", "8765"],
     })
 
-    # skills — from the skills-server pip package (console script)
-    skills_cmd = shutil.which("skills-server") or "skills-server"
-    servers.append({
-        "name": "skills",
-        "port": "9002",
-        "cmd": skills_cmd,
-        "args": ["--port", "9002", "--host", "0.0.0.0"],
-    })
+    # ipybox — HTTP MCP server from a separate container (docker-compose).
+    # We start a local HTTP listener that proxies to the ipybox container
+    # at http://ipybox:9006/mcp so the gateway can health-check it.
+    # The actual ipybox container is defined in docker-compose.yml.
+    ipybox_url = os.environ.get("IPYBOX_URL", "http://ipybox:9006/mcp")
+    if ipybox_url:
+        servers.append({
+            "name": "ipybox",
+            "port": "9006",
+            "cmd": "echo",
+            "args": ["ipybox is running as a separate container at " + ipybox_url],
+        })
 
     return servers
 
@@ -158,7 +173,7 @@ def run_watchdog(servers: List[ServerProcess], stop_event) -> None:
     while not stop_event.is_set():
         time.sleep(5)
         for s in servers:
-            if not s.is_alive() and not stop_event.is_set():
+            if not s.is_alive() and not s.is_alive() and not stop_event.is_set():
                 log.warning("Watchdog: %s MCP server died, restarting...", s.name)
                 s.start()
 
