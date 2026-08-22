@@ -120,15 +120,27 @@ class MountedServer:
         async def call_tool(name: str, arguments: dict):
             handler = self._tool_handlers.get(name)
             if handler is None:
-                return [TextContent(type="text", text=f"Unknown tool: {name}")]
+                return types.CallToolResult(
+                    content=[TextContent(type="text", text=f"Unknown tool: {name}")],
+                    isError=True,
+                )
             try:
                 result = await handler(**arguments)
-                if isinstance(result, str):
-                    return [TextContent(type="text", text=result)]
-                return result if isinstance(result, list) else [TextContent(type="text", text=str(result))]
+                if isinstance(result, types.CallToolResult):
+                    return result
+                elif isinstance(result, str):
+                    return types.CallToolResult(
+                        content=[TextContent(type="text", text=result)]
+                    )
+                return types.CallToolResult(
+                    content=result if isinstance(result, list) else [TextContent(type="text", text=str(result))]
+                )
             except Exception as e:
                 log.error("Tool '%s' error: %s", name, e, exc_info=True)
-                return [TextContent(type="text", text=f"Error: {e}")]
+                return types.CallToolResult(
+                    content=[TextContent(type="text", text=f"Error: {e}")],
+                    isError=True,
+                )
 
         # ------------------------------------------------------------
         # Prompts / prompt templates
@@ -251,15 +263,27 @@ class MountedServer:
                 async def call_tool_sse(name: str, arguments: dict):
                     handler = self._tool_handlers.get(name)
                     if handler is None:
-                        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+                        return types.CallToolResult(
+                            content=[TextContent(type="text", text=f"Unknown tool: {name}")],
+                            isError=True,
+                        )
                     try:
                         result = await handler(**arguments)
-                        if isinstance(result, str):
-                            return [TextContent(type="text", text=result)]
-                        return result if isinstance(result, list) else [TextContent(type="text", text=str(result))]
+                        if isinstance(result, types.CallToolResult):
+                            return result
+                        elif isinstance(result, str):
+                            return types.CallToolResult(
+                                content=[TextContent(type="text", text=result)]
+                            )
+                        return types.CallToolResult(
+                            content=result if isinstance(result, list) else [TextContent(type="text", text=str(result))]
+                        )
                     except Exception as e:
                         log.error("Tool '%s' error: %s", name, e, exc_info=True)
-                        return [TextContent(type="text", text=f"Error: {e}")]
+                        return types.CallToolResult(
+                            content=[TextContent(type="text", text=f"Error: {e}")],
+                            isError=True,
+                        )
 
                 await server.run(
                     read_stream,

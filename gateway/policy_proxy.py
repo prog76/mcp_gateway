@@ -43,6 +43,7 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp import ClientSession
 from mcp.shared.exceptions import McpError
+from mcp.types import CallToolResult, TextContent
 
 from gateway.mounted_server import MountedServer
 from gateway.policy_yaml import PolicyLoader
@@ -935,7 +936,9 @@ async def forward(bc, tool_name, arguments):
                 async with ClientSession(r, w) as s:
                     await s.initialize()
                     res = await s.call_tool(tool_name, arguments)
-                    return {"content": [c.text if hasattr(c, "text") else str(c) for c in res.content], "isError": res.isError}
+                    return {"content": [c.text if hasattr(c, "text") else str(c) for c in res.content],
+                            "structuredContent": getattr(res, "structuredContent", None),
+                            "isError": res.isError}
         elif _is_stdio(bc):
             pkw = bc.pass_kwargs_raw if isinstance(bc, BackendConfig) else bc.get("pass_kwargs_raw", False)
             ba = arguments if pkw else {k: v for k, v in arguments.items() if k != "kwargs"}
@@ -943,7 +946,9 @@ async def forward(bc, tool_name, arguments):
                 async with ClientSession(r, w) as s:
                     await s.initialize()
                     res = await s.call_tool(tool_name, ba)
-                    return {"content": [c.text if hasattr(c, "text") else str(c) for c in res.content], "isError": res.isError}
+                    return {"content": [c.text if hasattr(c, "text") else str(c) for c in res.content],
+                            "structuredContent": getattr(res, "structuredContent", None),
+                            "isError": res.isError}
         return {"error": f"Backend '{bc.name}': no valid transport"}
     except Exception as e:
         msg = _extract_mcp_error_message(e)
@@ -1185,6 +1190,19 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                       bc.name, tn, result["error"], _sanitize_args(policy_kw))
             return f"Error: {result['error']}"
         out = result.get("content", [""])[0]
+        structured = result.get("structuredContent")
+        is_error = result.get("isError", False)
+        if structured is not None:
+            return CallToolResult(
+                content=[TextContent(type="text", text=out)],
+                structuredContent=structured,
+                isError=is_error,
+            )
+        if is_error:
+            return CallToolResult(
+                content=[TextContent(type="text", text=out)],
+                isError=True,
+            )
         log.info("Tool call %s.%s OK (args=%s) -> %s",
                  bc.name, tn, _sanitize_args(policy_kw), _preview(out))
         return out
@@ -1529,13 +1547,26 @@ async def create_compound_server(compound: CompoundConfig,
                         if injections:
                             kw = {**kw, **injections}
 
-                        # Forward to backend
+                                                # Forward to backend
                         result = await forward(backend_cfg, original_name, kw)
                         if "error" in result:
                             log.error("Tool call %s.%s FAILED: %s (args=%s)",
                                       backend_cfg.name, original_name, result["error"], _sanitize_args(policy_kw))
                             return f"Error: {result['error']}"
                         out = result.get("content", [""])[0]
+                        structured = result.get("structuredContent")
+                        is_error = result.get("isError", False)
+                        if structured is not None:
+                            return CallToolResult(
+                                content=[TextContent(type="text", text=out)],
+                                structuredContent=structured,
+                                isError=is_error,
+                            )
+                        if is_error:
+                            return CallToolResult(
+                                content=[TextContent(type="text", text=out)],
+                                isError=True,
+                            )
                         log.info("Tool call %s.%s OK (args=%s) -> %s",
                                  backend_cfg.name, original_name, _sanitize_args(policy_kw), _preview(out))
                         return out

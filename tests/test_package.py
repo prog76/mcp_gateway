@@ -414,3 +414,125 @@ def test_resolve_injections_no_context_vars():
         policy_proxy._request_headers.reset(hr_token)
         policy_proxy._incoming_headers.reset(ih_token)
         policy_proxy._client_info.reset(ci_token)
+
+
+# ---------------------------------------------------------------------------
+# Structured-content passthrough (outputSchema "no structured output" bug)
+#
+# Regression for: a proxied tool that advertises an outputSchema fails with
+#   "Output validation error: outputSchema defined but no structured output returned"
+# because forward() discarded structuredContent from the upstream response and
+# MountedServer.call_tool collapsed everything to bare text blocks. A proxy
+# must preserve the upstream's structuredContent and return a CallToolResult so
+# the SDK does not re-validate (the upstream already validated it).
+# ---------------------------------------------------------------------------
+import asyncio
+import contextlib
+from unittest.mock import AsyncMock, MagicMock
+
+from mcp.types import CallToolResult, TextContent
+
+
+class _FakeCallToolResult:
+    """Shape of the MCP SDK's CallToolResult as seen by forward()."""
+
+    def __init__(self, content, structured_content=None, is_error=False):
+        self.content = content
+        self.structuredContent = structured_content
+        self.isError = is_error
+
+
+async def _run_forward(bc, tool_name, arguments, upstream_result):
+    """Call policy_proxy.forward with the network layer faked."""
+
+    @contextlib.asynccontextmanager
+    async def fake_http_client(*a, **kw):
+        yield (MagicMock(), MagicMock(), None)
+
+    session = MagicMock()
+    session.initialize = AsyncMock()
+    session.call_tool = AsyncMock(return_value=upstream_result)
+
+    class FakeClientSession:
+        def __init__(self, *a, **kw):
+            self._s = session
+
+        async def __aenter__(self):
+            return self._s
+
+        async def __aexit__(self, *exc):
+            return False
+
+    orig_client = policy_proxy.streamablehttp_client
+    orig_session = policy_proxy.ClientSession
+    policy_proxy.streamablehttp_client = fake_http_client
+    policy_proxy.ClientSession = FakeClientSession
+    try:
+        return await policy_proxy.forward(bc, tool_name, arguments)
+    finally:
+        policy_proxy.streamablehttp_client = orig_client
+        policy_proxy.ClientSession = orig_session
+
+
+def test_forward_preserves_structured_content():
+    """forward() must propagate structuredContent from the upstream response."""
+    bc = policy_proxy.BackendConfig(name="gitlab", url="http://gitlab/mcp", transport="http")
+    upstream = _FakeCallToolResult(
+        content=[TextContent(type="text", text="repo-list")],
+        structured_content={"projects": [{"name": "a"}, {"name": "b"}]},
+        is_error=False,
+    )
+    result = asyncio.run(_run_forward(bc, "list_group_projects", {"group_path": "x"}, upstream))
+    assert result["content"] == ["repo-list"]
+    assert result["structuredContent"] == {"projects": [{"name": "a"}, {"name": "b"}]}
+    assert result["isError"] is False
+
+
+def test_make_policy_handler_returns_calltoolresult_with_structured():
+    """With structuredContent present, the policy handler returns a CallToolResult
+    (so MountedServer / the SDK pass it through without revalidation)."""
+    bc = policy_proxy.BackendConfig(name="gitlab", url="http://gitlab/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="gitlab", healthy=True)
+    rules = [{"match": {"tool": ".*"}, "action": "allow"}]
+    handler = policy_proxy.make_policy_handler(bc, rules, "list_group_projects", status)
+
+    async def fake_forward(bc, tool_name, arguments):
+        return {
+            "content": ["repo-list"],
+            "structuredContent": {"projects": [{"name": "a"}]},
+            "isError": False,
+        }
+
+    orig_f = policy_proxy.forward
+    policy_proxy.forward = fake_forward
+    try:
+        out = asyncio.run(handler(group_path="x"))
+    finally:
+        policy_proxy.forward = orig_f
+
+    assert isinstance(out, CallToolResult)
+    assert out.structuredContent == {"projects": [{"name": "a"}]}
+    assert out.isError is False
+    assert out.content[0].text == "repo-list"
+
+
+def test_make_policy_handler_wraps_iserror_in_calltoolresult():
+    """An error-backed result becomes a CallToolResult flagged isError."""
+    bc = policy_proxy.BackendConfig(name="gitlab", url="http://gitlab/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="gitlab", healthy=True)
+    rules = [{"match": {"tool": ".*"}, "action": "allow"}]
+    handler = policy_proxy.make_policy_handler(bc, rules, "broken", status)
+
+    async def fake_forward(bc, tool_name, arguments):
+        return {"content": ["boom"], "isError": True}
+
+    orig_f = policy_proxy.forward
+    policy_proxy.forward = fake_forward
+    try:
+        out = asyncio.run(handler())
+    finally:
+        policy_proxy.forward = orig_f
+
+    assert isinstance(out, CallToolResult)
+    assert out.isError is True
+    assert out.content[0].text == "boom"
