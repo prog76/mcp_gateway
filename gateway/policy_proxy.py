@@ -463,6 +463,19 @@ class TelegramBackend:
                 }
                 r = await self._client.get(f"{self._api_base}/getUpdates", params=params)
                 if r.status_code != 200:
+                    # Surface Telegram's real error instead of silently looping.
+                    # A 409 Conflict here ("Conflict: terminated by other
+                    # getupdates request") means another long-poll getUpdates is
+                    # active for this bot (e.g. a second gateway instance) — this
+                    # instance can't receive updates until the other one stops.
+                    tg_desc = ""
+                    with contextlib.suppress(Exception):
+                        tg_desc = r.json().get("description", "")
+                    detail = tg_desc or r.text.strip()
+                    log.warning("Telegram getUpdates failed: HTTP %s%s%s",
+                                r.status_code,
+                                f" {r.reason_phrase}" if r.reason_phrase else "",
+                                f" — {detail}" if detail else "")
                     await asyncio.sleep(self.poll_interval)
                     continue
 
