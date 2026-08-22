@@ -113,6 +113,33 @@ rules:
       caller_ip: "${header:X-Client-IP}"
 ```
 
+## Compounds proxy prompts from backends
+
+Compound endpoints expose `prompts/list` + `prompts/get` by **proxying** to their
+backends: `MountedServer` accepts a single `prompt_proxy(kind, name)` hook, which
+`create_compound_server` wires to `forward_prompts()` (merged/deduped for `list`,
+first hit for `get`).
+
+```yaml
+# compounds.yaml
+compounds:
+  local:
+    path: /mcp/local
+    backends: [ipybox, exec]
+    headers:
+      X-MCP-Endpoint: "http://mcp:8000/mcp/local"
+```
+
+| Symbol | Role |
+|---|---|
+| `prompt_proxy(kind, name)` | `MountedServer` hook delegating `prompts/list` + `prompts/get` to backends |
+| `forward_prompts(bc, kind, name)` | proxies a single backend's prompt list/get |
+
+> **Note**: prompt-body templating — e.g. `{{ mcp_list_upstreams() }}` in
+> `infra_bootstrap.md` — happens **kernel-side** in the ipybox MCP server, not in
+> the gateway. ipybox reads the per-compound `X-MCP-Endpoint` header that the
+> gateway forwards, and uses it to call back to the correct compound endpoint.
+
 ## Development
 
 ```bash

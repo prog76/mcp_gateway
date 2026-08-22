@@ -857,96 +857,6 @@ def _get_nested(d: dict, key: str) -> Any:
     return d
 
 
-# Regex matching {{ mcp_call('tool_name') }} and {{ mcp_call("tool_name") }}
-_MCP_CALL_RE = re.compile(r"\{\{\s*mcp_call\(['\"]([^'\"]+)['\"]\)\s*\}\}")
-
-
-async def _call_mcp_from_compound(tool_name: str, compound: "CompoundConfig",
-                                  backend_status_map: Dict[str, "BackendStatus"]) -> str:
-    """Resolve a single {{ mcp_call('tool_name') }} by calling the MCP tool.
-
-    The *tool_name* uses the compound-prefixed form (e.g.
-    ``ipybox_list_skills``).  This function finds the backend that owns the
-    tool, strips the prefix, and forwards the call via :func:`forward`.
-
-    Returns the tool's text result (first content item) or an error string
-    if the tool/backend is unavailable.
-    """
-    # Find the backend that provides this tool by checking the compound's
-    # backends.  Each backend's registered tools are prefixed with
-    # ``{backend_name}_``.
-    for backend_name in compound.backends:
-        if backend_name not in backend_status_map:
-            continue
-        status = backend_status_map[backend_name]
-        if not status.healthy:
-            continue
-        prefix = f"{backend_name}_"
-        if tool_name.startswith(prefix):
-            original_name = tool_name[len(prefix):]
-            bc = status.config
-            # Set up per-request effective headers so forward() sends the
-            # compound's headers to the backend (same logic as compound
-            # tool handlers).
-            info = _client_info.get()
-            effective_headers = dict(bc.headers or {})
-            if compound.headers:
-                for hk, hv in compound.headers.items():
-                    effective_headers[hk] = _resolve_compound_header_value(hv, info)
-            hh_token = _request_headers.set(effective_headers)
-            try:
-                result = await forward(bc, original_name, {})
-                if "error" in result:
-                    log.error("mcp_call '%s' failed: %s", tool_name, result["error"])
-                    return f"[mcp_call error for '{tool_name}': {result['error']}]"
-                if result.get("isError") and result.get("content"):
-                    err_text = result["content"][0]
-                    log.error("mcp_call '%s' failed: %s", tool_name, err_text)
-                    return f"[mcp_call error for '{tool_name}': {err_text}]"
-                content = result.get("content", [""])
-                text = content[0] if content else ""
-                return text
-            except Exception as e:
-                log.error("mcp_call '%s' exception: %s", tool_name, e, exc_info=True)
-                return f"[mcp_call error for '{tool_name}': {e}]"
-            finally:
-                _request_headers.reset(hh_token)
-    return f"[mcp_call error: tool '{tool_name}' not found on any backend in compound '{compound.name}']"
-
-
-async def resolve_mcp_call_templates(
-    prompt_text: str,
-    compound: "CompoundConfig",
-    backend_status_map: Dict[str, "BackendStatus"],
-) -> str:
-    """Resolve ``{{ mcp_call('tool_name') }}`` templates in prompt text.
-
-    For each ``mcp_call`` invocation, the function:
-      1. Finds which backend in *compound* provides the (prefixed) tool name.
-      2. Strips the backend prefix to get the original tool name.
-      3. Calls the tool via :func:`forward` with the compound's effective
-         headers set in the per-request ``_request_headers`` ContextVar.
-      4. Substitutes the tool's text result into the prompt text.
-
-    If no templates are present the text is returned unchanged.  If a tool
-    call fails, an error string is substituted so the prompt remains usable.
-    """
-    if not prompt_text or not _MCP_CALL_RE.search(prompt_text):
-        return prompt_text
-
-    matches = list(_MCP_CALL_RE.finditer(prompt_text))
-    parts: List[str] = []
-    last_end = 0
-    for match in matches:
-        parts.append(prompt_text[last_end:match.start()])
-        tool_name = match.group(1)
-        result_text = await _call_mcp_from_compound(tool_name, compound, backend_status_map)
-        parts.append(result_text)
-        last_end = match.end()
-    parts.append(prompt_text[last_end:])
-    return "".join(parts)
-
-
 def matches_rule(rule: dict, tool_name: str, arguments: dict) -> bool:
     spec = rule.get("match", {})
 
@@ -1425,7 +1335,7 @@ async def create_compound_server(compound: CompoundConfig,
     # has the named prompt is used.  The backend's effective headers
     # (compound + backend merged, per-request resolved) are set in the
     # _request_headers ContextVar so forward_prompts sends them to the
-    # backend — mirroring _call_mcp_from_compound.
+    # backend — mirroring the compound tool handlers.
     async def prompt_proxy(kind: str, name: Optional[str] = None):
         if kind == "list":
             seen = set()

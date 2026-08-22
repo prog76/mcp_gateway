@@ -62,7 +62,6 @@ class MountedServer:
         prompts: Optional[dict[str, str]] = None,
         strip_output_schema: bool = False,
         stateless: bool = False,
-        prompt_resolver: Optional[Callable[[str], Awaitable[str]]] = None,
         prompt_proxy: Optional[Callable[[str, Optional[str]], Awaitable]] = None,
     ):
         self.name = name
@@ -71,15 +70,11 @@ class MountedServer:
         self._tools: List[Tool] = []
         self._tool_handlers: dict[str, Callable] = {}
         self._prompts: dict[str, str] = prompts or {}
-        # Optional async callable that resolves template variables (e.g.
-        # {{ mcp_call('tool_name') }}) in prompt text before it is returned
-        # to the client.  When None, the prompt text is returned verbatim.
-        self._prompt_resolver = prompt_resolver
         # Optional async callable that proxies prompt requests (list/get) to a
         # downstream backend.  Signature: (kind: "list"|"get", name:
         # Optional[str]) -> list[Prompt] | GetPromptResult | None.  When set,
         # prompts/list and prompts/get are delegated to the proxy instead of
-        # the static self._prompts / self._prompt_resolver path.
+        # the static self._prompts path.
         self._prompt_proxy = prompt_proxy
         # When True, the prompt proxy is the exclusive handler; the static
         # self._prompts path is unused.
@@ -159,16 +154,9 @@ class MountedServer:
                     if result is None:
                         raise ValueError(f"Unknown prompt: {name}")
                     return result
-                # Resolve {{ mcp_call('tool_name') }} templates in the prompt
-                # text by calling the referenced MCP tool at request time.
                 if name not in self._prompts:
                     raise ValueError(f"Unknown prompt: {name}")
                 prompt_text = self._prompts[name]
-                if self._prompt_resolver is not None:
-                    try:
-                        prompt_text = await self._prompt_resolver(prompt_text)
-                    except Exception as e:
-                        log.error("prompt_resolver error for prompt '%s': %s", name, e, exc_info=True)
                 return types.GetPromptResult(
                     description=f"Prompt: {name}",
                     messages=[
@@ -245,13 +233,6 @@ class MountedServer:
                         if name not in self._prompts:
                             raise ValueError(f"Unknown prompt: {name}")
                         prompt_text = self._prompts[name]
-                        # Resolve {{ mcp_call('tool_name') }} templates for
-                        # legacy SSE clients too.
-                        if self._prompt_resolver is not None:
-                            try:
-                                prompt_text = await self._prompt_resolver(prompt_text)
-                            except Exception as e:
-                                log.error("prompt_resolver error for prompt '%s': %s", name, e, exc_info=True)
                         return types.GetPromptResult(
                             description=f"Prompt: {name}",
                             messages=[

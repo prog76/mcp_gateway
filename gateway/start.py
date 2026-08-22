@@ -38,12 +38,13 @@ def _env(key: str, default: str) -> str:
 
 
 def _build_mcp_servers(kubeconfig_path: str) -> List[Dict[str, str]]:
-    """Build the list of background MCP servers (name/port/cmd/args).
+    """Build the list of background MCP server subprocesses (name/port/cmd/args).
 
     The exec backend is a stdio server spawned on-demand by policy_proxy
     (see config/policy/real/exec.yaml with transport: stdio), so it does
-    NOT appear here.  ipybox is expected to be a separate container
-    (http://ipybox:9006).
+    NOT appear here.  ipybox is also NOT included: it runs as its own
+    container (http://ipybox:9006) and is health-checked/proxied by the
+    gateway policy, not managed as a local subprocess.
     """
     servers = []
     python = sys.executable
@@ -74,19 +75,6 @@ def _build_mcp_servers(kubeconfig_path: str) -> List[Dict[str, str]]:
         "cmd": python,
         "args": ["-m", "gateway.foxmcp_server", "--mcp-port", "9005", "--ws-port", "8765"],
     })
-
-    # ipybox — HTTP MCP server from a separate container (docker-compose).
-    # We start a local HTTP listener that proxies to the ipybox container
-    # at http://ipybox:9006/mcp so the gateway can health-check it.
-    # The actual ipybox container is defined in docker-compose.yml.
-    ipybox_url = os.environ.get("IPYBOX_URL", "http://ipybox:9006/mcp")
-    if ipybox_url:
-        servers.append({
-            "name": "ipybox",
-            "port": "9006",
-            "cmd": "echo",
-            "args": ["ipybox is running as a separate container at " + ipybox_url],
-        })
 
     return servers
 
