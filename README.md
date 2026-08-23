@@ -29,17 +29,19 @@ client library.
 mcp-gateway-start
 ```
 
-This starts the background MCP servers (k8s, netbox, secure-fox) and then
-runs the policy proxy in the foreground — the same behavior as the original
-`start.sh`. The exec backend is a stdio MCP server spawned on-demand by the
-proxy.
+This runs the policy proxy in the foreground. The gateway is a **pure policy
+proxy**: long-running backend MCP servers (k8s, netbox, browser/secure-fox,
+ipybox) run as their own containers supervised by the orchestrator
+(docker-compose), and policies reference them by service URL
+(`http://netbox:9004/mcp`, ...). The exec backend is a stdio MCP server
+spawned per-request by the proxy — request-scoped execution, not daemon
+supervision.
 
 ## Environment variables
 
 | Variable | Default |
 |---|---|
 | `POLICY_DIR` | `/etc/mcp-gateways/policy` |
-| `KUBECONFIG_PATH` | `/root/.kube/k3s.yaml` |
 | `POLICY_PROXY_PORT` | `8000` |
 | `POLICY_PROXY_HOST` | `0.0.0.0` |
 | `VALIDATE_POLICY_PATH` | `/opt/validate_policy.py` |

@@ -180,22 +180,18 @@ def test_mounted_server_importable():
     """MountedServer class is importable."""
     assert hasattr(mounted_server, "MountedServer")
 def test_start_entrypoint_helpers():
-    """The start module builds the background MCP server list (no network)."""
+    """The start module is a pure policy-proxy entrypoint (no child servers)."""
     from gateway import start
 
-    # No kubeconfig -> skip k8s
-    servers = start._build_mcp_servers("/nonexistent/kubeconfig")
-    names = [s["name"] for s in servers]
-    assert "k8s" not in names
-    assert "netbox" in names
-    # browser (secure-fox) is launched via its console script, not imported
-    browser = [s for s in servers if s["name"] == "browser"]
-    assert len(browser) == 1
-    assert browser[0]["cmd"] == "securefox-mcp-server"
-    assert "--mcp-port" in browser[0]["args"]
-    # ipybox is NOT a local subprocess — it runs as its own container
-    # (http://ipybox:9006) and is health-checked/proxied by the gateway.
-    assert "ipybox" not in names
+    # Background-server supervision was removed: backends run as their own
+    # containers, supervised by the orchestrator (docker-compose).
+    assert not hasattr(start, "_build_mcp_servers")
+    assert not hasattr(start, "ServerProcess")
+    assert not hasattr(start, "run_watchdog")
+    # The entrypoint still exposes policy validation + the proxy runner.
+    assert callable(start.validate_policies)
+    assert callable(start.run_proxy_forever)
+    assert callable(start.main)
 def test_start_main_entrypoint_registered():
     """The console script references gateway.start.main."""
     import importlib.metadata

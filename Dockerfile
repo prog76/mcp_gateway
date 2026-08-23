@@ -1,17 +1,24 @@
-# mcp-gateway image — owned by the gateway project.
+# mcp-gateway BASE image — owned by the gateway project.
 #
-# Base for deploy: system deps + upstream MCP server binaries (k8s, netbox,
-# grafana) + core python deps + chroot tree + pip-installed packages:
-#   - gateway        (policy_proxy, exec_mcp_server, start entrypoint)
-#   - secure-fox     (browser-control MCP server, launched by start.py via
-#                     its `securefox-mcp-server` console script; referenced
-#                     only through policy, never imported by gateway)
-# Nothing is COPYed from a data tree — runtime config is bind-mounted by
-# docker-compose in ../deploy.
+# Contains ONLY what every gateway deployment needs:
+#   - system deps + core python deps
+#   - pip-installed packages: gateway (policy proxy + exec stdio server)
+#     and secure-fox (browser-control MCP server)
+#   - chroot tree for shell_exec
+#
+# Long-running backend MCP servers (k8s, netbox, grafana) are NOT included:
+# they run as their own containers, supervised by the orchestrator, and are
+# referenced by policy via service URLs. The `browser` service reuses this
+# same image with a command override (`securefox-mcp-server`).
+#
+# Version pinning: GATEWAY_VERSION / SECUREFOX_VERSION accept a git ref —
+# a branch name (e.g. `main`, dev mode) or a tag (`v0.2.0`, pinned release).
 
 FROM python:3.12-slim
 
 ARG SHELL_CHROOT_DIR=/opt/shell-chroot
+ARG GATEWAY_VERSION=main
+ARG SECUREFOX_VERSION=main
 
 # ------------------------------------------------------------------
 # System dependencies
@@ -22,23 +29,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     git \
     && rm -rf /var/lib/apt/lists/*
-
-# ------------------------------------------------------------------
-# Upstream MCP servers
-# ------------------------------------------------------------------
-ARG K8S_MCP_VERSION=v0.0.62
-RUN curl -fsSL "https://github.com/containers/kubernetes-mcp-server/releases/download/${K8S_MCP_VERSION}/kubernetes-mcp-server-linux-amd64" \
-    -o /usr/local/bin/kubernetes-mcp-server \
-    && chmod +x /usr/local/bin/kubernetes-mcp-server
-
-ARG NETBOX_MCP_VERSION=v1.2.0
-RUN pip install --no-cache-dir git+https://github.com/netboxlabs/netbox-mcp-server.git@${NETBOX_MCP_VERSION}
-
-ARG GRAFANA_MCP_VERSION=v0.17.2
-RUN curl -fsSL "https://github.com/grafana/mcp-grafana/releases/download/${GRAFANA_MCP_VERSION}/mcp-grafana_Linux_x86_64.tar.gz" \
-    -o /tmp/mcp-grafana.tar.gz \
-    && tar -xzf /tmp/mcp-grafana.tar.gz -C /usr/local/bin \
-    && chmod +x /usr/local/bin/mcp-grafana
 
 # ------------------------------------------------------------------
 # Core python deps
@@ -52,17 +42,14 @@ RUN pip install --no-cache-dir \
 
 # ------------------------------------------------------------------
 # Extracted packages (pip from GitHub).
-#   github.com/prog76/mcp_mcp2cli    (shared MCP client library)
-#   github.com/prog76/mcp_gateway    (this package)
-#   github.com/prog76/mcp_secure-fox (browser backend, console-script launched)
-#
-# Pin exact tags here when consuming released versions, e.g.
-#   "gateway @ git+https://github.com/prog76/mcp_gateway.git@vX.Y.Z"
+#   github.com/prog76/mcp_mcp2cli     (shared MCP client library)
+#   github.com/prog76/mcp_gateway     (this package)
+#   github.com/prog76/mcp_secure-fox  (browser backend, own container)
 # ------------------------------------------------------------------
 RUN pip install --no-cache-dir --no-binary :all: \
     "mcp2cli @ git+https://github.com/prog76/mcp_mcp2cli.git" \
-    "gateway @ git+https://github.com/prog76/mcp_gateway.git" \
-    "secure-fox @ git+https://github.com/prog76/mcp_secure-fox.git"
+    "gateway @ git+https://github.com/prog76/mcp_gateway.git@${GATEWAY_VERSION}" \
+    "secure-fox @ git+https://github.com/prog76/mcp_secure-fox.git@${SECUREFOX_VERSION}"
 
 # ------------------------------------------------------------------
 # Directories
@@ -94,7 +81,7 @@ RUN mkdir -p "${SHELL_CHROOT_DIR}" \
     && mknod -m 666 "${SHELL_CHROOT_DIR}/dev/urandom" c 1 9 \
     && mknod -m 666 "${SHELL_CHROOT_DIR}/dev/random" c 1 8
 
-EXPOSE 8000 9001 9002 9003 9004 9005 8765
+EXPOSE 8000
 
 # Entrypoint ships in the mcp-gateway package.
 ENTRYPOINT ["mcp-gateway-start"]
