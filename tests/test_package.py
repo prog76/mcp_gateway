@@ -536,3 +536,136 @@ def test_make_policy_handler_wraps_iserror_in_calltoolresult():
     assert isinstance(out, CallToolResult)
     assert out.isError is True
     assert out.content[0].text == "boom"
+
+
+# ---------------------------------------------------------------------------
+# Compound discovery caching: create_compound_server must reuse the tool list
+# already cached on BackendStatus.tools (from Phase 1 backend mounting)
+# instead of calling discover_from_backend() again for each compound.
+# ---------------------------------------------------------------------------
+
+
+class _FakeTool:
+    """Minimal stand-in for an mcp.types.Tool with the attributes
+    create_compound_server / register_backend_tools read."""
+
+    def __init__(self, name, description="test tool"):
+        self.name = name
+        self.description = description
+        self.inputSchema = {"type": "object", "properties": {}}
+        self.input_schema = self.inputSchema
+        self.outputSchema = None
+        self.output_schema = None
+
+
+def test_compound_server_reuses_cached_tools_no_rediscovery():
+    """create_compound_server must NOT call discover_from_backend when
+    BackendStatus already has cached tools from Phase 1 (backend mounting).
+
+    This is the core optimization: a backend shared across N compounds is
+    discovered once at startup, not N+1 times.
+    """
+    bc = policy_proxy.BackendConfig(
+        name="fakebackend",
+        url="http://fakebackend:9001/mcp",
+        transport="http",
+        path="/mcp/fakebackend",
+    )
+
+    status = policy_proxy.BackendStatus(
+        name="fakebackend",
+        healthy=True,
+        config=bc,
+        rules=[{"match": {"tool": ".*"}, "action": "allow"}],
+        tools=[_FakeTool("list_items"), _FakeTool("get_item")],
+    )
+
+    backend_status_map = {"fakebackend": status}
+
+    compound = policy_proxy.CompoundConfig(
+        name="test_compound",
+        path="/mcp/test_compound",
+        backends=["fakebackend"],
+    )
+
+    # Wrap discover_from_backend to detect any call.
+    call_count = {"n": 0}
+    original = policy_proxy.discover_from_backend
+
+    async def counting_discover(bc):
+        call_count["n"] += 1
+        return [], None
+
+    policy_proxy.discover_from_backend = counting_discover
+    try:
+        server, compound_status = asyncio.run(
+            policy_proxy.create_compound_server(
+                compound, backend_status_map, 8000, ["localhost"]
+            )
+        )
+    finally:
+        policy_proxy.discover_from_backend = original
+
+    # Key assertion: zero re-discovery calls.
+    assert call_count["n"] == 0, (
+        f"Expected discover_from_backend to be called 0 times, but it was "
+        f"called {call_count['n']} times — tools should be reused from cache."
+    )
+
+    # Functionality preserved: prefixed tools registered on the compound server.
+    assert compound_status.tools_count == 2
+    assert compound_status.healthy is True
+    registered = [t.name for t in server._tools]
+    assert "fakebackend_list_items" in registered
+    assert "fakebackend_get_item" in registered
+
+
+def test_compound_server_skips_unhealthy_backend_no_rediscovery():
+    """An unhealthy backend (no cached tools) must be skipped by the compound
+    without calling discover_from_backend."""
+    bc = policy_proxy.BackendConfig(
+        name="downbackend",
+        url="http://downbackend:9001/mcp",
+        transport="http",
+        path="/mcp/downbackend",
+    )
+
+    status = policy_proxy.BackendStatus(
+        name="downbackend",
+        healthy=False,
+        config=bc,
+        rules=[{"match": {"tool": ".*"}, "action": "deny"}],
+        tools=[],
+    )
+
+    backend_status_map = {"downbackend": status}
+
+    compound = policy_proxy.CompoundConfig(
+        name="test_compound",
+        path="/mcp/test_compound",
+        backends=["downbackend"],
+    )
+
+    call_count = {"n": 0}
+    original = policy_proxy.discover_from_backend
+
+    async def counting_discover(bc):
+        call_count["n"] += 1
+        return [], None
+
+    policy_proxy.discover_from_backend = counting_discover
+    try:
+        server, compound_status = asyncio.run(
+            policy_proxy.create_compound_server(
+                compound, backend_status_map, 8000, ["localhost"]
+            )
+        )
+    finally:
+        policy_proxy.discover_from_backend = original
+
+    assert call_count["n"] == 0, (
+        f"Expected discover_from_backend to be called 0 times for an unhealthy "
+        f"backend, but it was called {call_count['n']} times."
+    )
+    assert compound_status.tools_count == 0
+    assert compound_status.healthy is False

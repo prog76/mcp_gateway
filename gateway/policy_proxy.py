@@ -241,6 +241,12 @@ class BackendStatus:
     server: Optional[MountedServer] = None
     config: Optional[BackendConfig] = None
     rules: List[Dict] = field(default_factory=list)
+    # Cached tool list from the most recent successful discovery.
+    # Populated by register_backend_tools() and the discovery watchdog so
+    # that create_compound_server() can reuse the tools already discovered
+    # during Phase 1 (backend mounting) instead of re-discovering them
+    # redundantly for each compound the backend participates in.
+    tools: List = field(default_factory=list)
 
 
 @dataclass
@@ -922,15 +928,16 @@ async def discover_from_backend(bc) -> Tuple[List, Optional[str]]:
                 return [], f"Backend '{bc.name}': no valid transport"
         except Exception as e:
             last_error = e
+            err_msg = _extract_mcp_error_message(e)
             if attempt < MAX_DISCOVERY_RETRIES:
                 log.warning("Failed to discover tools from %s (attempt %d/%d): %s. Retrying in %.1fs...",
-                           bc.name, attempt, MAX_DISCOVERY_RETRIES, e, DISCOVERY_RETRY_DELAY)
+                           bc.name, attempt, MAX_DISCOVERY_RETRIES, err_msg, DISCOVERY_RETRY_DELAY)
                 await asyncio.sleep(DISCOVERY_RETRY_DELAY)
             else:
                 log.warning("Failed to discover tools from %s after %d attempts: %s",
-                           bc.name, MAX_DISCOVERY_RETRIES, e)
+                           bc.name, MAX_DISCOVERY_RETRIES, err_msg)
 
-    err_msg = str(last_error) if last_error else "unknown error"
+    err_msg = _extract_mcp_error_message(last_error) if last_error else "unknown error"
     log.error("Could not discover tools from %s after %d retries: %s", bc.name, MAX_DISCOVERY_RETRIES, err_msg)
     return [], f"Backend '{bc.name}' unavailable: {err_msg}"
 
@@ -1234,9 +1241,14 @@ async def register_backend_tools(server: MountedServer, bc: BackendConfig,
     if error:
         status.healthy = False
         status.tools_count = 0
+        status.tools = []
         status.error = error
         log.warning("No tools registered for %s: %s", bc.name, error)
         return 0
+
+    # Cache the discovered tools so compound servers can reuse them
+    # without re-discovering (see create_compound_server).
+    status.tools = tools
 
     count = 0
     for t in tools:
@@ -1301,6 +1313,7 @@ async def discovery_watchdog(backend_statuses: List[BackendStatus]):
 
             status.healthy = True
             status.tools_count = count
+            status.tools = tools
             status.error = None
             log.info("Watchdog: recovered %s — registered %d tools", status.name, count)
 
@@ -1477,11 +1490,15 @@ async def create_compound_server(compound: CompoundConfig,
         bc = backend_status.config
         rules = backend_status.rules
 
-        # Discover tools from this backend
-        tools, error = await discover_from_backend(bc)
-        if error:
-            log.warning("Compound '%s': failed to discover tools from '%s': %s",
-                       compound.name, backend_name, error)
+        # Reuse the tool list already discovered during backend mounting
+        # (Phase 1) instead of re-discovering.  The backend was confirmed
+        # healthy above, so its tools are cached in BackendStatus.tools.
+        # This avoids a redundant MCP connection (HTTP handshake + initialize
+        # + list_tools, or stdio subprocess spawn) per compound.
+        tools = backend_status.tools
+        if not tools:
+            log.warning("Compound '%s': backend '%s' has no cached tools (skipping)",
+                       compound.name, backend_name)
             compound_status.backends_status[backend_name] = backend_status
             continue
 
