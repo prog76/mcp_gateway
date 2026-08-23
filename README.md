@@ -160,9 +160,9 @@ Manual release flow (the workflow tests/builds/publishes on tag):
 1. Bump `version` in `pyproject.toml`, `_version.py`, and `__init__.py`
    (keep them matching).
 2. Commit, `git tag vX.Y.Z`, then `git push && git push --tags`.
-3. The workflow runs tests, publishes the wheel/sdist to PyPI (OIDC trusted
-   publishing), and pushes `ghcr.io/prog76/mcp-gateway:vX.Y.Z`.
-4. Manually pin the new version in `deploy/Dockerfile` (pip refs / image tag).
+3. The workflow runs tests and pushes `ghcr.io/prog76/mcp-gateway:vX.Y.Z`.
+4. Manually pin the new version in deploy (`.env`: `GATEWAY_VERSION=vX.Y.Z`).
+   Packages are installed from git refs, not PyPI.
 
 ## Publishing
 
