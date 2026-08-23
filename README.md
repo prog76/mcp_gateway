@@ -18,10 +18,10 @@ client library.
 | `gateway.start` | Container entrypoint that reproduces `start.sh` behavior |
 
 > **secure-fox** (browser control) is a separate package
-> (`github.com/prog76/mcp_secure-fox`). It is installed into the image and
-> launched by its console script `securefox-mcp-server`; the gateway proxies
-> to it via policy (`deploy/config/policy/real/browser.yaml`) and does not
-> import it.
+> (`github.com/prog76/mcp_secure-fox`). It runs as its **own container**
+> (reusing this project's image with an entrypoint override) and the gateway
+> proxies to it via policy (`deploy/config/policy/real/browser.yaml`,
+> `http://browser:9005/mcp`). The gateway never imports it.
 
 ## Console script
 
