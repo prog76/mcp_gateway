@@ -2,7 +2,7 @@
 """
 gateway.start — Container entrypoint that reproduces start.sh behavior.
 
-Starts the background MCP server processes (k8s, netbox, foxmcp, ipybox),
+Starts the background MCP server processes (k8s, netbox, browser, ipybox),
 then runs the policy proxy in the foreground:
 
   1. Read env vars (POLICY_DIR, KUBECONFIG_PATH, POLICY_PROXY_PORT, ...)
@@ -47,7 +47,6 @@ def _build_mcp_servers(kubeconfig_path: str) -> List[Dict[str, str]]:
     gateway policy, not managed as a local subprocess.
     """
     servers = []
-    python = sys.executable
 
     # k8s — started only if kubeconfig exists
     if os.path.exists(kubeconfig_path):
@@ -68,12 +67,15 @@ def _build_mcp_servers(kubeconfig_path: str) -> List[Dict[str, str]]:
         "args": ["--transport", "http", "--port", "9004", "--host", "0.0.0.0"],
     })
 
-    # foxmcp — vendored server in this package (WebSocket for extension + MCP)
+    # browser — the secure-fox package (standalone, installed in the image).
+    # Launched via its console script like the other external servers; the
+    # gateway does not import securefox — it proxies to it via policy
+    # (deploy/config/policy/real/browser.yaml, url http://localhost:9005/mcp).
     servers.append({
-        "name": "foxmcp",
+        "name": "browser",
         "port": "9005",
-        "cmd": python,
-        "args": ["-m", "gateway.foxmcp_server", "--mcp-port", "9005", "--ws-port", "8765"],
+        "cmd": "securefox-mcp-server",
+        "args": ["--mcp-port", "9005", "--ws-port", "8765"],
     })
 
     return servers

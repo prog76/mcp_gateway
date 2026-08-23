@@ -188,7 +188,11 @@ def test_start_entrypoint_helpers():
     names = [s["name"] for s in servers]
     assert "k8s" not in names
     assert "netbox" in names
-    assert "foxmcp" in names
+    # browser (secure-fox) is launched via its console script, not imported
+    browser = [s for s in servers if s["name"] == "browser"]
+    assert len(browser) == 1
+    assert browser[0]["cmd"] == "securefox-mcp-server"
+    assert "--mcp-port" in browser[0]["args"]
     # ipybox is NOT a local subprocess — it runs as its own container
     # (http://ipybox:9006) and is health-checked/proxied by the gateway.
     assert "ipybox" not in names

@@ -15,9 +15,13 @@ client library.
 | `gateway.policy_yaml` | `PolicyLoader` — SafeLoader extended with a `!concat` tag |
 | `gateway.validate_policy` | Policy file validator |
 | `gateway.mcp_onboard` | Onboarding helper that generates starter policy YAML from discovered tools |
-| `gateway.foxmcp_server` | Secure FoxMCP server (browser control via Firefox extension) |
-| `gateway.foxmcp_vendored` | Vendored upstream FoxMCP server package |
 | `gateway.start` | Container entrypoint that reproduces `start.sh` behavior |
+
+> **secure-fox** (browser control) is a separate package
+> (`github.com/prog76/mcp_secure-fox`). It is installed into the image and
+> launched by its console script `securefox-mcp-server`; the gateway proxies
+> to it via policy (`deploy/config/policy/real/browser.yaml`) and does not
+> import it.
 
 ## Console script
 
@@ -25,7 +29,7 @@ client library.
 mcp-gateway-start
 ```
 
-This starts the background MCP servers (k8s, netbox, foxmcp, ipybox) and then
+This starts the background MCP servers (k8s, netbox, secure-fox) and then
 runs the policy proxy in the foreground — the same behavior as the original
 `start.sh`. The exec backend is a stdio MCP server spawned on-demand by the
 proxy.
@@ -146,6 +150,17 @@ compounds:
 pip install -e ".[dev]"
 python -m pytest
 ```
+
+## Releasing
+
+Manual release flow (the workflow tests/builds/publishes on tag):
+
+1. Bump `version` in `pyproject.toml`, `_version.py`, and `__init__.py`
+   (keep them matching).
+2. Commit, `git tag vX.Y.Z`, then `git push && git push --tags`.
+3. The workflow runs tests, publishes the wheel/sdist to PyPI (OIDC trusted
+   publishing), and pushes `ghcr.io/prog76/mcp-gateway:vX.Y.Z`.
+4. Manually pin the new version in `deploy/Dockerfile` (pip refs / image tag).
 
 ## Publishing
 
