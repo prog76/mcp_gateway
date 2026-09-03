@@ -47,7 +47,12 @@ supervision.
 | `VALIDATE_POLICY_PATH` | `/opt/validate_policy.py` |
 | `COMPOUNDS_CONFIG` | `/etc/mcp-gateways/compounds.yaml` |
 | `NOTIFICATION_CONFIG` | `/etc/mcp-gateways/notifications.yaml` |
+| `MCP_CONFIRM_PROGRESS_INTERVAL` | `5.0` |
 | `MCP_REQUEST_HEADER_CAPTURE` | *(empty — disabled)* |
+
+`MCP_CONFIRM_PROGRESS_INTERVAL` — cadence (seconds) for MCP progress
+notifications sent to a calling agent while it is blocked on a Telegram
+`confirm` approval. Only emitted when the client supplied a `progressToken`.
 
 `MCP_REQUEST_HEADER_CAPTURE` — comma-separated list of incoming HTTP header
 names to capture from the MCP client request. Captured headers are available

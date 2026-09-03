@@ -93,6 +93,10 @@ WATCHDOG_INTERVAL = float(os.environ.get("MCP_WATCHDOG_INTERVAL", "30.0"))
 # Reverse DNS timeout (seconds)
 DNS_TIMEOUT = float(os.environ.get("MCP_DNS_TIMEOUT", "1.0"))
 
+# Cadence for MCP progress notifications sent to an agent while it waits on a
+# Telegram "confirm" approval (seconds).
+PROGRESS_INTERVAL = float(os.environ.get("MCP_CONFIRM_PROGRESS_INTERVAL", "5.0"))
+
 
 @dataclass
 class ClientInfo:
@@ -1076,6 +1080,36 @@ def create_allowed_hosts(http_port: int) -> List[str]:
     return sorted(hosts)
 
 
+async def _run_confirm_progress_ticker(relay, request_id: str, timeout: int,
+                                       started_ts: float) -> None:
+    """Send periodic progress notifications to the agent while we are blocked
+    awaiting the operator's decision in Telegram.
+
+    ``relay`` is the MCP progress-relay callback set by ``MountedServer.call_tool``
+    (see ``get_upstream_progress_callback``). It is created as a child task in the
+    same event loop so the contextvar-scoped callback stays visible. The ticker
+    is cancelled by the confirm branch on resolution (approve/reject/timeout) or
+    self-terminates if the relay fails (e.g. the client stream has gone away).
+    """
+    interval = PROGRESS_INTERVAL
+    while True:
+        await asyncio.sleep(interval)
+        elapsed = int(time.monotonic() - started_ts)
+        try:
+            await relay(
+                progress=float(elapsed),
+                total=float(timeout),
+                message=(
+                    f"⏳ Awaiting operator approval in Telegram "
+                    f"(request id: {request_id[:8]}…, {elapsed}s / {timeout}s)"
+                ),
+            )
+        except Exception:
+            # Relay failed / client is gone — stop ticking without breaking
+            # the underlying confirm wait.
+            break
+
+
 def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
     """Create a handler function for a tool with policy enforcement.
 
@@ -1128,6 +1162,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     request_id = str(uuid.uuid4())
                     pending = PendingRequest(request_id=request_id)
                     _pending_requests[request_id] = pending
+                    started_ts = time.monotonic()
 
                     # Resolve templates for the messages
                     reason = resolve_template(rule.get("reason", "Operator declined"), tn, policy_kw)
@@ -1166,18 +1201,42 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         _pending_requests.pop(request_id, None)
                         return "ACCESS DENIED: Failed to send approval request to operator"
 
+                    # Optional: send periodic MCP progress notifications to the
+                    # agent while we await the operator's decision (only when the
+                    # calling client supplied a progressToken / relay callback).
+                    relay = get_upstream_progress_callback()
+                    ticker = None
+                    if relay is not None:
+                        ticker = asyncio.create_task(
+                            _run_confirm_progress_ticker(relay, request_id, timeout, started_ts)
+                        )
+
+                    def _stop_ticker():
+                        if ticker is not None and not ticker.done():
+                            ticker.cancel()
+
                     # Wait for operator response with timeout
                     try:
                         await asyncio.wait_for(pending.event.wait(), timeout=timeout)
                     except asyncio.TimeoutError:
+                        _stop_ticker()
                         # Edit the Telegram message to show timed out status
                         await _telegram_backend.edit_request_timeout(request_id)
                         _pending_requests.pop(request_id, None)
                         return timeout_template
 
+                    _stop_ticker()
                     _pending_requests.pop(request_id, None)
 
                     if not pending.approved:
+                        # Best-effort final notification to the agent.
+                        if relay is not None:
+                            with contextlib.suppress(Exception):
+                                await relay(
+                                    progress=float(timeout),
+                                    total=float(timeout),
+                                    message=f"❌ Operator declined the approval request ({request_id[:8]}…)",
+                                )
                         return denied_template
 
                     # Operator approved — forward to real backend

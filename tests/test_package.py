@@ -669,3 +669,80 @@ def test_compound_server_skips_unhealthy_backend_no_rediscovery():
     )
     assert compound_status.tools_count == 0
     assert compound_status.healthy is False
+
+
+def test_confirm_emits_progress_notifications():
+    """A confirm-action handler that is blocked awaiting a Telegram decision must
+    emit periodic MCP progress notifications to the agent (when a relay is set),
+    and stop once the operator approves."""
+    bc = policy_proxy.BackendConfig(name="gitlab", url="http://gitlab/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="gitlab", healthy=True)
+    rules = [
+        {
+            "match": {"tool": ".*"},
+            "action": "confirm",
+            "timeout": 30,
+        }
+    ]
+
+    progress_calls = []
+
+    async def fake_relay(progress, total, message):
+        progress_calls.append((progress, total, message))
+
+    class FakeTelegramBackend:
+        async def send_approval_request(self, **kw):
+            return True
+
+        async def edit_request_timeout(self, request_id):
+            pass
+
+    async def fake_forward(bc, tool_name, arguments):
+        return {"content": ["approved-ok"], "structuredContent": None, "isError": False}
+
+    orig_callback = policy_proxy.get_upstream_progress_callback
+    orig_tg = policy_proxy._telegram_backend
+    orig_forward = policy_proxy.forward
+    orig_interval = policy_proxy.PROGRESS_INTERVAL
+
+    async def scenario():
+        policy_proxy._telegram_backend = FakeTelegramBackend()
+        policy_proxy.get_upstream_progress_callback = lambda: fake_relay
+        policy_proxy.forward = fake_forward
+        policy_proxy.PROGRESS_INTERVAL = 0.02
+
+        handler = policy_proxy.make_policy_handler(bc, rules, "git", status)
+        task = asyncio.create_task(handler(repo="x"))
+
+        # Wait until the confirm branch registers a PendingRequest.
+        for _ in range(500):
+            if policy_proxy._pending_requests:
+                break
+            await asyncio.sleep(0.01)
+        assert policy_proxy._pending_requests, "confirm never created a pending request"
+
+        _rid, pending = next(iter(policy_proxy._pending_requests.items()))
+        # Let the ticker heartbeat a few times while we're "waiting".
+        await asyncio.sleep(0.1)
+        # Simulate the operator approving in Telegram.
+        pending.approved = True
+        pending.event.set()
+        out = await task
+        return out
+
+    try:
+        out = asyncio.run(scenario())
+    finally:
+        policy_proxy.get_upstream_progress_callback = orig_callback
+        policy_proxy._telegram_backend = orig_tg
+        policy_proxy.forward = orig_forward
+        policy_proxy.PROGRESS_INTERVAL = orig_interval
+        policy_proxy._pending_requests.clear()
+
+    # We must have received at least one progress notification during the wait.
+    assert progress_calls, "expected progress notifications during the Telegram confirm wait"
+    for progress, total, message in progress_calls:
+        assert total == 30
+        assert "approval" in message.lower()
+    # The handler resolved with the approved-forward result after approval.
+    assert "approved-ok" in out
