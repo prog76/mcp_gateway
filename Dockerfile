@@ -34,7 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Core python deps
 # ------------------------------------------------------------------
 RUN pip install --no-cache-dir \
-    fastmcp>=2.0.0 \
+    mcp>=1.28.1,<2 \
+    fastmcp>=3.4.2,<4 \
     jsonschema>=4.0.0 \
     pyyaml>=6.0 \
     httpx>=0.27.0 \
