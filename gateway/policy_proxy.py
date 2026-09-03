@@ -45,7 +45,7 @@ from mcp import ClientSession
 from mcp.shared.exceptions import McpError
 from mcp.types import CallToolResult, TextContent
 
-from gateway.mounted_server import MountedServer
+from gateway.mounted_server import MountedServer, get_upstream_progress_callback
 from gateway.policy_yaml import PolicyLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -942,7 +942,9 @@ async def discover_from_backend(bc) -> Tuple[List, Optional[str]]:
     return [], f"Backend '{bc.name}' unavailable: {err_msg}"
 
 
-async def forward(bc, tool_name, arguments):
+async def forward(bc, tool_name, arguments, progress_callback=None):
+    if progress_callback is None:
+        progress_callback = get_upstream_progress_callback()
     try:
         if _is_http(bc):
             # Use per-request effective headers if set (by compound handlers),
@@ -955,7 +957,8 @@ async def forward(bc, tool_name, arguments):
             async with streamablehttp_client(bc.url, headers=headers) as (r, w, _):
                 async with ClientSession(r, w) as s:
                     await s.initialize()
-                    res = await s.call_tool(tool_name, arguments)
+                    res = await s.call_tool(tool_name, arguments,
+                                            progress_callback=progress_callback)
                     return {"content": [c.text if hasattr(c, "text") else str(c) for c in res.content],
                             "structuredContent": getattr(res, "structuredContent", None),
                             "isError": res.isError}
@@ -965,7 +968,8 @@ async def forward(bc, tool_name, arguments):
             async with stdio_client(_build_stdio_params(bc)) as (r, w):
                 async with ClientSession(r, w) as s:
                     await s.initialize()
-                    res = await s.call_tool(tool_name, ba)
+                    res = await s.call_tool(tool_name, ba,
+                                            progress_callback=progress_callback)
                     return {"content": [c.text if hasattr(c, "text") else str(c) for c in res.content],
                             "structuredContent": getattr(res, "structuredContent", None),
                             "isError": res.isError}

@@ -13,6 +13,7 @@ Supports both:
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 from typing import Any, Optional, List, Callable, Awaitable
 
@@ -32,6 +33,41 @@ import mcp.types as types
 from mcp.types import Tool, TextContent
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Upstream progress-relay contextvar
+# ---------------------------------------------------------------------------
+# When the gateway forwards a tool call to a downstream MCP backend (e.g.
+# ipybox's ``execute_code`` which runs ``job_wait`` for up to 300s), that
+# backend may emit progress notifications (``ProgressNotification``) on the
+# gateway↔backend connection.  Without relay, those notifications are
+# swallowed — the gateway's ``forward()`` returns a plain dict and the
+# original MCP client never sees them.
+#
+# The ``call_tool`` handler below (registered on the MCP SDK lowlevel
+# ``Server``) checks the incoming request's ``progressToken``.  If the
+# client provided one, it builds a relay callback that re-sends progress
+# notifications to the *client* (via ``ServerSession.send_progress_notification``)
+# and stores it in this contextvar.  ``forward()`` in ``policy_proxy.py``
+# picks it up and passes it as ``progress_callback`` to the downstream
+# ``ClientSession.call_tool``, which makes the downstream server (ipybox)
+# actually emit progress notifications.
+#
+# Contextvars are inherited by child tasks within the same event loop, so
+# the callback set here is visible inside ``forward()`` and its callees.
+# ---------------------------------------------------------------------------
+UpstreamProgressCallback = Callable[
+    [float, Optional[float], Optional[str]], Awaitable[None]
+]
+
+_upstream_progress_callback: contextvars.ContextVar[
+    Optional[UpstreamProgressCallback]
+] = contextvars.ContextVar("upstream_progress_callback", default=None)
+
+
+def get_upstream_progress_callback() -> Optional[UpstreamProgressCallback]:
+    """Return the progress-relay callback set by ``call_tool``, or ``None``."""
+    return _upstream_progress_callback.get()
 
 
 class MountedServer:
@@ -124,6 +160,50 @@ class MountedServer:
                     content=[TextContent(type="text", text=f"Unknown tool: {name}")],
                     isError=True,
                 )
+
+            # --- Progress relay setup ---
+            # Extract the MCP client's progress token from the incoming request
+            # context (set by the MCP SDK before calling this handler).  If the
+            # client provided a progressToken, build a callback that re-sends
+            # progress notifications to the client.  The callback is stored in a
+            # contextvar so that forward() (and its callees) can pick it up and
+            # pass it as progress_callback to the downstream ClientSession.call_tool,
+            # which makes the downstream server (e.g. ipybox) emit progress
+            # notifications in the first place.
+            callback_token = None
+            try:
+                rc = self._mcp.request_context
+                if rc is not None and rc.meta is not None:
+                    progress_token = rc.meta.progressToken
+                else:
+                    progress_token = None
+                client_session = rc.session if rc is not None else None
+            except LookupError:
+                # No active request context — proceed without relay.
+                progress_token = None
+                client_session = None
+
+            if progress_token is not None and client_session is not None:
+                async def _relay(
+                    progress: float,
+                    total: Optional[float],
+                    message: Optional[str],
+                ) -> None:
+                    """Relay a progress notification from the backend to the client."""
+                    try:
+                        await client_session.send_progress_notification(
+                            progress_token=progress_token,
+                            progress=progress,
+                            total=total,
+                            message=message,
+                        )
+                    except Exception:
+                        # Best-effort: never let a relay failure break the
+                        # underlying tool call.
+                        pass
+
+                callback_token = _upstream_progress_callback.set(_relay)
+
             try:
                 result = await handler(**arguments)
                 if isinstance(result, types.CallToolResult):
@@ -141,6 +221,9 @@ class MountedServer:
                     content=[TextContent(type="text", text=f"Error: {e}")],
                     isError=True,
                 )
+            finally:
+                if callback_token is not None:
+                    _upstream_progress_callback.reset(callback_token)
 
         # ------------------------------------------------------------
         # Prompts / prompt templates
