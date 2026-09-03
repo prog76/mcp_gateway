@@ -317,10 +317,72 @@ class PendingRequest:
     created_at: float = field(default_factory=time.monotonic)
     message_id: Optional[int] = None
     chat_id: Optional[int] = None
+    # Scope metadata used to arm a 1-minute "allow for this session" bypass.
+    session_id: str = ""
+    client_key: str = ""
+    backend_name: str = ""
+    rule_index: int = -1
 
 
 # Global store of pending approval requests: request_id -> PendingRequest
 _pending_requests: Dict[str, PendingRequest] = {}
+
+# ---------------------------------------------------------------------------
+# 1-minute "allow for this session" confirm bypass
+# ---------------------------------------------------------------------------
+# Operators can grant ONE confirm rule a short-lived (default 60s) allowance,
+# scoped to a single MCP session + client connection. While an allowance is
+# active, that exact rule short-circuits the Telegram confirm flow (no notification).
+# Keyed by: ((session-scoped client_key, backend_name, rule_index) -> monotonic expiry.
+
+_TEMP_ALLOW_WINDOW = float(os.environ.get("MCP_TEMP_ALLOW_SECONDS", "60"))
+_temp_allowances: Dict[Tuple[str, str, int], float] = {}
+
+
+def _captured_session_id() -> str:
+    """Return the Mcp-Session-Id captured from the incoming MCP request (or \"\")."""
+    incoming = _incoming_headers.get() or {}
+    for name in ("Mcp-Session-Id", "mcp-session-id", "MCP-SESSION-ID"):
+        val = incoming.get(name)
+        if val:
+            return str(val)
+    return ""
+
+
+def _allowance_key(info: Optional[ClientInfo], backend_name: str, rule_index: int) -> Optional[Tuple[str, str, int]]:
+    """Return the temp-allowance store key for a call, or None if it cannot be scoped.
+
+    The Mcp-Session-Id header is client-supplied, so it alone could be spoofed
+    to inherit another session's grant. Binding the key to (session id | client IP)
+    keeps a grant tight to this session ON this connection — another chat/assistant
+    (different session id or different origin) won't match. Returns None when there
+    is no session id (then the confirm flow simply doesn't offer the bypass)."""
+    sid = _captured_session_id()
+    if not sid:
+        return None
+    ip = info.ip if info is not None else "unknown"
+    return (f"{ip}|{sid}", backend_name, rule_index)
+
+
+def _sweep_temp_allowances():
+    """Drop expired temp-allowance entries (called opportunistically)."""
+    now = time.monotonic()
+    expired = [k for k, exp in _temp_allowances.items() if exp <= now]
+    for k in expired:
+        _temp_allowances.pop(k, None)
+
+
+def _temp_allow_active(akey: Tuple[str, str, int]) -> bool:
+    """True if an operator-granted 1-minute allowance for this scope is unexpired."""
+    if not akey:
+        return False
+    expiry = _temp_allowances.get(akey)
+    if expiry is None:
+        return False
+    if expiry <= time.monotonic():
+        _temp_allowances.pop(akey, None)
+        return False
+    return True
 
 # Global notification config (loaded at startup)
 _notification_config: Optional[NotificationConfig] = None
@@ -396,7 +458,8 @@ class TelegramBackend:
 
     async def send_approval_request(self, request_id: str, tool_name: str,
                                     arguments: dict, client_info: Optional[ClientInfo],
-                                    reason: str, backend_name: str = "") -> bool:
+                                    reason: str, backend_name: str = "",
+                                    session_id: str = "") -> bool:
         """Send a message with Approve/Reject buttons. Returns True if sent OK."""
         # Build a readable plain-text summary. No parse_mode is used, so no
         # escaping is needed — any character is safe. Long values (e.g. a
@@ -425,14 +488,21 @@ class TelegramBackend:
         ]
         if client_info:
             text_parts.append(f"Client: {client_info.host} / {client_info.ip}")
+        if session_id:
+            text_parts.append(f"Session: {session_id}")
 
         text = "\n".join(text_parts)
 
+        # When the request is session-scoped, offer an optional 1-minute bypass
+        # button that auto-approves THIS exact rule for that session (no re-notify).
+        buttons = [
+            {"text": "✅ Approve", "callback_data": f"approve:{request_id}"},
+        ]
+        if session_id:
+            buttons.append({"text": "⏱ Allow 1 min (session)", "callback_data": f"allow1m:{request_id}"})
+        buttons.append({"text": "❌ Reject", "callback_data": f"reject:{request_id}"})
         keyboard = {
-            "inline_keyboard": [[
-                {"text": "✅ Approve", "callback_data": f"approve:{request_id}"},
-                {"text": "❌ Reject", "callback_data": f"reject:{request_id}"},
-            ]]
+            "inline_keyboard": [[button for button in buttons]],
         }
 
         payload = {
@@ -520,6 +590,21 @@ class TelegramBackend:
                         original_text = msg.get("text", "")
                         operator_name = from_user.get('first_name', 'Operator')
                         status_text = f"Status: approved by {operator_name}\n"
+                        if "Status:" in original_text:
+                            updated_text = re.sub(r"Status:.*\n", status_text, original_text)
+                        else:
+                            updated_text = original_text.rstrip("\n") + "\n\n" + status_text
+                        await self._edit_message(chat["id"], msg["message_id"], updated_text, remove_keyboard=True)
+                    elif action == "allow1m":
+                        # Operator granted a short-lived session-scoped bypass: auto-approve THIS
+                        # exact confirm rule for the remaining window (no re-notification needed).
+                        if pending.client_key and pending.rule_index >= 0:
+                            _temp_allowances[(pending.client_key, pending.backend_name, pending.rule_index)] = time.monotonic() + _TEMP_ALLOW_WINDOW
+                        pending.approved = True
+                        await self._answer_callback(cq["id"], "⏱ Approved for 1 minute (this session) — executing now")
+                        original_text = msg.get("text", "")
+                        operator_name = from_user.get("first_name", "Operator")
+                        status_text = f"Status: approved for 1 min (session) by {operator_name}\n"
                         if "Status:" in original_text:
                             updated_text = re.sub(r"Status:.*\n", status_text, original_text)
                         else:
@@ -1139,7 +1224,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
         tn = tool_name
         injections = {}
         rule_matched = False
-        for rule in rules:
+        for rule_index, rule in enumerate(rules):
             if matches_rule(rule, tn, policy_kw):
                 action = rule.get("action", "deny")
 
@@ -1156,11 +1241,36 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
 
                 elif action == "confirm":
                     # --- Confirm action: ask operator for approval ---
+                    # If the operator previously granted a short-lived (60s) allowance for THIS
+                    # exact rule on this MCP session, skip the Telegram confirm flow entirely.
+
+
+
+                    allowance_key = _allowance_key(info, bc.name, rule_index)
+                    if _temp_allow_active(allowance_key):
+                        # Grant still unexpired — bypass confirm, treat as allow (injections
+                        # collected from earlier inject_argument rules are still applied).
+                        rule_matched = True
+                        log.info("Tool call %s.%s ALLOWED via operator 1-min session allowance(rule idx %d) - skipping confirm", bc.name, tn, rule_index)
+                        break
                     if _telegram_backend is None:
                         return "ACCESS DENIED: confirm action requires a notification backend (none configured)"
 
                     request_id = str(uuid.uuid4())
                     pending = PendingRequest(request_id=request_id)
+
+
+                    # Capture scope scope so the Telegram callback can arm a session-scoped 1-minute
+                    # allowance without having to re-derive it from the request context.
+
+                    pending.session_id = _captured_session_id()
+                    pending.backend_name = bc.name
+                    pending.rule_index = rule_index
+                    sid = pending.session_id
+                    # client_key binds (session id | client ip) so a grant stays tight to this
+                    # session ON this connection — another chat/assistant is excluded.
+
+                    pending.client_key = allowance_key[0] if allowance_key else ""
                     _pending_requests[request_id] = pending
                     started_ts = time.monotonic()
 
@@ -1196,6 +1306,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         client_info=info,
                         reason=reason,
                         backend_name=bc.name,
+                        session_id=sid,
                     )
                     if not sent:
                         _pending_requests.pop(request_id, None)
@@ -1343,6 +1454,8 @@ async def discovery_watchdog(backend_statuses: List[BackendStatus]):
     """
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL)
+        # Opportunistically drop expired 1-min session allowances (lazy cleanup).
+        _sweep_temp_allowances()
         for status in backend_statuses:
             if status.healthy:
                 continue

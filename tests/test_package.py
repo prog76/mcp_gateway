@@ -427,6 +427,7 @@ def test_resolve_injections_no_context_vars():
 # the SDK does not re-validate (the upstream already validated it).
 # ---------------------------------------------------------------------------
 import asyncio
+import time
 import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
@@ -746,3 +747,86 @@ def test_confirm_emits_progress_notifications():
         assert "approval" in message.lower()
     # The handler resolved with the approved-forward result after approval.
     assert "approved-ok" in out
+
+
+def test_allowance_key_requires_session():
+    """_allowance_key returns None when no Mcp-Session-Id is present."""
+
+    assert policy_proxy._allowance_key(None, "gitlab", 0) is None
+    assert policy_proxy._allowance_key(policy_proxy.ClientInfo(ip="1.2.3.4", host="h"), "gitlab", 0) is None
+
+
+def test_allowance_key_binds_session_and_ip():
+    """The allowance key binds (session id | client ip), backend name, rule index."""
+
+    token = policy_proxy._incoming_headers.set({"Mcp-Session-Id": "sess-1"})
+    try:
+        info = policy_proxy.ClientInfo(ip="1.2.3.4", host="h")
+        k1 = policy_proxy._allowance_key(info, "gitlab", 2)
+        assert k1 == ("1.2.3.4|sess-1", "gitlab", 2)
+        # A different session id yields a different key (no cross-session grant).
+        k2 = policy_proxy._allowance_key(info, "gitlab", 2)  # same — recheck
+        assert k1 == k2
+        # Different origin (ip0 changes the key too (prevents spoofing via header only).
+        k3 = policy_proxy._allowance_key(policy_proxy.ClientInfo(ip="9.9.9.9", host="h2"), "gitlab", 2)
+        assert k1 != k3
+    finally:
+        policy_proxy._incoming_headers.reset(token)
+
+
+def test_temp_allow_active_arm_and_expire():
+    """Armed temp allowances are active until they expire, then dropped."""
+
+    key = ("ip|sess-1", "gitlab", 0)
+    policy_proxy._temp_allowances[key] = time.monotonic() + 60
+    assert policy_proxy._temp_allow_active(key) is True
+    # Expired entry → inactive,and removed.
+
+    policy_proxy._temp_allowances[key] = time.monotonic() - 1
+
+    assert policy_proxy._temp_allow_active(key) is False
+    assert key not in policy_proxy._temp_allowances
+    # Unknown key → inactive (no crash).
+    assert policy_proxy._temp_allow_active(("ip|nope", "gitlab", 0)) is False
+    policy_proxy._temp_allowances.clear()
+
+
+def test_confirm_branch_bypasses_when_allowance_active():
+    """An armed 1-minute session allowance short-circuits a confirm rule: the
+    call forwards without asking the operator and without creating a PendingRequest."""
+    bc = policy_proxy.BackendConfig(name="gitlab", url="http://gitlab/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="gitlab", healthy=True)
+    rules = [
+        {"match": {"tool": ".*", "repo": ".*"}, "action": "confirm"},
+    ]
+    forwarded = []
+
+    async def fake_forward(bc, tool_name, arguments):
+        forwarded.append((tool_name, arguments))
+        return {"content": ["bypassed-ok"], "structuredContent": None, "isError": False}
+
+    orig_forward = policy_proxy.forward
+    t_cli = None
+    t_hdr = None
+    try:
+        policy_proxy.forward = fake_forward
+        t_cli = policy_proxy._client_info.set(policy_proxy.ClientInfo(ip="1.2.3.4", host="h"))
+        t_hdr = policy_proxy._incoming_headers.set({"Mcp-Session-Id": "sess-1"})
+
+        key = policy_proxy._allowance_key(policy_proxy.ClientInfo(ip="1.2.3.4", host="h"), "gitlab", 0)
+        policy_proxy._temp_allowances[key] = time.monotonic() + 60
+
+        handler = policy_proxy.make_policy_handler(bc, rules, "git", status)
+        out = asyncio.run(handler(repo="x"))
+
+        # Bypassed: forwarded once, no pending request left, no confirm templates exposed.
+
+        assert forwarded == [("git", {"repo": "x"})]
+        assert "bypassed-ok" in out
+        assert policy_proxy._pending_requests == {}
+    finally:
+        policy_proxy.forward = orig_forward
+        policy_proxy._client_info.reset(t_cli)
+        policy_proxy._incoming_headers.reset(t_hdr)
+        policy_proxy._temp_allowances.clear()
+        policy_proxy._pending_requests.clear()

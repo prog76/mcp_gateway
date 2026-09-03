@@ -49,6 +49,7 @@ supervision.
 | `NOTIFICATION_CONFIG` | `/etc/mcp-gateways/notifications.yaml` |
 | `MCP_CONFIRM_PROGRESS_INTERVAL` | `5.0` |
 | `MCP_REQUEST_HEADER_CAPTURE` | *(empty — disabled)* |
+| `MCP_TEMP_ALLOW_SECONDS` | `60` |
 
 `MCP_CONFIRM_PROGRESS_INTERVAL` — cadence (seconds) for MCP progress
 notifications sent to a calling agent while it is blocked on a Telegram
@@ -59,6 +60,26 @@ names to capture from the MCP client request. Captured headers are available
 for compound header resolution via `${request_header:NAME}`. Enables
 auth-passthrough (e.g. forwarding the client's `Authorization` header to the
 downstream backend).
+
+`MCP_TEMP_ALLOW_SECONDS` — how long a session-scoped confirm bypass stays
+armed after the operator clicks the **"⏱ Allow 1 min (session)"** button in a
+`confirm` Telegram message. Default `60`.
+
+### 1-minute session confirm bypass
+
+When a `confirm` rule is triggered and fora request that carries `Mcp-Session-Id`
+(a client-supplied MCP session header, captured via `MCP_REQUEST_HEADER_CAPTURE`),
+the operator is offered an extra **"⏱ Allow 1 min (session)"** button next to
+Approve / Reject. Clicking it approves **this one call** (like Approve) **and**
+arms a short-lived allowance that auto-approves **this exact confirm rule** — the same
+`match` spec at the same index on the same backend — for the remaining window,
+**scoped to that session and that client connection**. Any other chat/assistant (different
+session id or different origin) won't match the allowance and continues to hit the normal
+Telegram confirm flow. The bypass is keyed by `(client IP | Mcp-Session-Id,
+backend name, rule index)` so the client-supplied header alone can't be spoofed to
+inherit another session's grant. Allowances are stored in memory and expire on gateway
+restart (acceptable for a sub-minute grant). No notification is sent to the operator
+for bypassed calls — the agent just executes. Logged for audit at INFO level.
 
 ## Compound headers → policy injection
 
