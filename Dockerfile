@@ -18,7 +18,7 @@ FROM python:3.12-slim
 
 ARG SHELL_CHROOT_DIR=/opt/shell-chroot
 ARG GATEWAY_VERSION=main
-ARG SECUREFOX_VERSION=main
+ARG SECUREFOX_VERSION=v0.1.1
 
 # ------------------------------------------------------------------
 # System dependencies
