@@ -34,12 +34,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Core python deps
 # ------------------------------------------------------------------
 RUN pip install --no-cache-dir \
-    mcp>=1.28.1,<2 \
-    fastmcp>=3.4.2,<4 \
-    jsonschema>=4.0.0 \
-    pyyaml>=6.0 \
-    httpx>=0.27.0 \
-    websockets>=12.0
+    "mcp>=1.28.1,<2" \
+    "fastmcp>=3.4.2,<4" \
+    "jsonschema>=4.0.0" \
+    "pyyaml>=6.0" \
+    "httpx>=0.27.0" \
+    "websockets>=12.0"
 
 # ------------------------------------------------------------------
 # Extracted packages (pip from GitHub).
