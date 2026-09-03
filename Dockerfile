@@ -19,6 +19,7 @@ FROM python:3.12-slim
 ARG SHELL_CHROOT_DIR=/opt/shell-chroot
 ARG GATEWAY_VERSION=main
 ARG SECUREFOX_VERSION=v0.1.1
+ARG MCP2CLI_VERSION=v0.1.1
 
 # ------------------------------------------------------------------
 # System dependencies
@@ -48,7 +49,7 @@ RUN pip install --no-cache-dir \
 #   github.com/prog76/mcp_secure-fox  (browser backend, own container)
 # ------------------------------------------------------------------
 RUN pip install --no-cache-dir --no-binary :all: \
-    "mcp2cli @ git+https://github.com/prog76/mcp_mcp2cli.git" \
+    "mcp2cli @ git+https://github.com/prog76/mcp_mcp2cli.git@${MCP2CLI_VERSION}" \
     "gateway @ git+https://github.com/prog76/mcp_gateway.git@${GATEWAY_VERSION}" \
     "secure-fox @ git+https://github.com/prog76/mcp_secure-fox.git@${SECUREFOX_VERSION}"
 
