@@ -13,13 +13,14 @@
 #
 # Version pinning: GATEWAY_VERSION / SECUREFOX_VERSION accept a git ref —
 # a branch name (e.g. `main`, dev mode) or a tag (`v0.2.0`, pinned release).
+# mcp2cli is pinned transitively via the dependency declared in pyproject.toml
+# (so a single spec is the source of truth and pip never sees a conflict).
 
 FROM python:3.12-slim
 
 ARG SHELL_CHROOT_DIR=/opt/shell-chroot
 ARG GATEWAY_VERSION=main
 ARG SECUREFOX_VERSION=v0.1.1
-ARG MCP2CLI_VERSION=v0.1.1
 
 # ------------------------------------------------------------------
 # System dependencies
@@ -44,12 +45,11 @@ RUN pip install --no-cache-dir \
 
 # ------------------------------------------------------------------
 # Extracted packages (pip from GitHub).
-#   github.com/prog76/mcp_mcp2cli     (shared MCP client library)
 #   github.com/prog76/mcp_gateway     (this package)
 #   github.com/prog76/mcp_secure-fox  (browser backend, own container)
+# mcp2cli is pulled in transitively by gateway (pinned in pyproject.toml).
 # ------------------------------------------------------------------
 RUN pip install --no-cache-dir --no-binary :all: \
-    "mcp2cli @ git+https://github.com/prog76/mcp_mcp2cli.git@${MCP2CLI_VERSION}" \
     "gateway @ git+https://github.com/prog76/mcp_gateway.git@${GATEWAY_VERSION}" \
     "secure-fox @ git+https://github.com/prog76/mcp_secure-fox.git@${SECUREFOX_VERSION}"
 
