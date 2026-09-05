@@ -17,16 +17,34 @@ Run modes:
 """
 
 import os
-import shlex
 import subprocess
 from typing import Any, Dict, List, Optional
 
 try:
     from fastmcp import FastMCP
+    from fastmcp.tools.base import ToolResult
 except ImportError:  # pragma: no cover
     from mcp.server.fastmcp import FastMCP
 
+from mcp.types import TextContent
+
 mcp = FastMCP("exec")
+
+
+def _exec_result(base, text, ok, error, exit_code, stdout="", stderr="", timed_out=False):
+    """Build a ToolResult: human text in ``content``, machine dict in structuredContent."""
+    return ToolResult(
+        content=[TextContent(type="text", text=text)],
+        structured_content=dict(
+            base,
+            ok=ok,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=timed_out,
+            error=error,
+        ),
+    )
 
 
 @mcp.tool()
@@ -37,7 +55,7 @@ async def run(
     cwd: Optional[str] = None,
     timeout: int = 60,
     stdin: Optional[str] = None,
-) -> str:
+) -> Any:
     """
     Run a command with optional environment and timeout.
 
@@ -54,12 +72,18 @@ async def run(
         stdin: Optional string piped to the subprocess stdout.
 
     Returns:
-        Combined stdout + stderr (stdout first, separated by a header).
+        A FastMCP ToolResult carrying (a) a human-readable text block in
+        ``content`` (stdout, then a ``--- stderr ---`` header if any, then
+        errors) and (b) a machine-readable payload in ``structuredContent``:
+        {ok, exit_code, stdout, stderr, timed_out, error, command, binary}.
+        The text stays human-friendly for agents; automation reads the
+        structured dict (exposed as structured_content by mcp_call / mcp2cli).
     """
     env = env or {}
     run_env = os.environ.copy()
     run_env.update(env)
 
+    base = {"command": command, "binary": binary}
     try:
         proc = subprocess.run(
             command,
@@ -70,16 +94,55 @@ async def run(
             text=True,
             timeout=timeout,
         )
-        output = proc.stdout
-        if proc.stderr:
-            output += "\n--- stderr ---\n" + proc.stderr
-        return output
-    except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout}s"
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        text = stdout
+        if stderr:
+            text += "\n--- stderr ---\n" + stderr
+        return _exec_result(
+            base, text,
+            ok=proc.returncode == 0,
+            error=None,
+            exit_code=proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except subprocess.TimeoutExpired as e:
+        # Capture any partial output produced before the kill.
+        _o, _s = _extract_exc_output(e)
+        return _exec_result(
+            base,
+            f"Command timed out after {timeout}s",
+            ok=False, error=f"Command timed out after {timeout}s",
+            exit_code=None, stdout=_o, stderr=_s, timed_out=True,
+        )
     except FileNotFoundError:
-        return f"Error: binary '{binary}' not found"
-    except Exception as e:
-        return f"Error: {e}"
+        return _exec_result(
+            base,
+            f"Error: binary '{binary}' not found",
+            ok=False, error=f"binary '{binary}' not found",
+            exit_code=None,
+        )
+    except Exception as exc:
+        return _exec_result(
+            base,
+            f"Error: {exc}",
+            ok=False, error=str(exc),
+            exit_code=None,
+        )
+
+
+def _extract_exc_output(exc: Any):
+    """Best-effort pull partial stdout/stderr from a TimeoutExpired exception."""
+    stdout = ""
+    stderr = ""
+    _o = getattr(exc, "stdout", None) or ""
+    _s = getattr(exc, "stderr", None) or ""
+    if _o:
+        stdout = _o.decode(errors="replace") if isinstance(_o, bytes) else _o
+    if _s:
+        stderr = _s.decode(errors="replace") if isinstance(_s, bytes) else _s
+    return stdout, stderr
 
 
 if __name__ == "__main__":
