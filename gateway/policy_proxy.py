@@ -1000,6 +1000,12 @@ async def discover_from_backend(bc) -> Tuple[List, Optional[str]]:
         try:
             if _is_http(bc):
                 headers = bc.headers if isinstance(bc, BackendConfig) else bc.get("headers")
+                # Resolve ${env:VAR} placeholders in header values (P06 fix)
+                if headers:
+                    headers = {
+                        k: resolve_env_value(v) if isinstance(v, str) else v
+                        for k, v in headers.items()
+                    }
                 async with streamablehttp_client(bc.url, headers=headers) as (r, w, _):
                     async with ClientSession(r, w) as s:
                         await s.initialize()
@@ -1043,6 +1049,12 @@ async def forward(bc, tool_name, arguments, progress_callback=None):
                 headers = ctx_headers
             else:
                 headers = bc.headers if isinstance(bc, BackendConfig) else bc.get("headers")
+            # Resolve ${env:VAR} placeholders in header values (P06 fix)
+            if headers:
+                headers = {
+                    k: resolve_env_value(v) if isinstance(v, str) else v
+                    for k, v in headers.items()
+                }
             async with streamablehttp_client(bc.url, headers=headers) as (r, w, _):
                 async with ClientSession(r, w) as s:
                     await s.initialize()
@@ -1089,6 +1101,12 @@ async def forward_prompts(bc, kind: str, name: Optional[str] = None):
                 headers = ctx_headers
             else:
                 headers = bc.headers if isinstance(bc, BackendConfig) else bc.get("headers")
+            # Resolve ${env:VAR} placeholders in header values (P06 fix)
+            if headers:
+                headers = {
+                    k: resolve_env_value(v) if isinstance(v, str) else v
+                    for k, v in headers.items()
+                }
             async with streamablehttp_client(bc.url, headers=headers) as (r, w, _):
                 async with ClientSession(r, w) as s:
                     await s.initialize()
