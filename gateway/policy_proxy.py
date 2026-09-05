@@ -1696,10 +1696,13 @@ async def create_compound_server(compound: CompoundConfig,
             compound_status.backends_status[backend_name] = backend_status
             continue
 
-        # Register tools with prefix
+        # Register tools with prefix (skip if tool already has the prefix)
         prefix = f"{backend_name}_"
         for t in tools:
-            prefixed_name = f"{prefix}{t.name}"
+            if t.name.startswith(prefix):
+                prefixed_name = t.name  # Already prefixed by backend
+            else:
+                prefixed_name = f"{prefix}{t.name}"
 
             # Check for collisions
             if prefixed_name in registered_tools:
