@@ -118,6 +118,8 @@ _request_headers: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars
 # MCP client's request. Compounds can reference these via ${request_header:NAME}
 # to dynamically forward client-supplied headers downstream.
 _incoming_headers: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar("incoming_headers", default=None)
+# Incoming request path (for skills-compound scoping of the bypass).
+_request_path: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_path", default=None)
 
 # DNS reverse lookup cache: ip -> hostname
 _dns_cache: Dict[str, str] = {}
@@ -178,12 +180,25 @@ class ClientInfoMiddleware(BaseHTTPMiddleware):
                 if val is not None:
                     incoming[name] = val
         ih_token = _incoming_headers.set(incoming or None)
+        rp_token = _request_path.set(request.url.path)
+
+        # Skills compound: require the shared bypass token (skills-ipybox only).
+        if request.url.path.rstrip("/") == "/mcp/skills":
+            expected = os.environ.get("SKILLS_BYPASS_TOKEN", "")
+            got = request.headers.get("x-skill-bypass", "")
+            if not expected or got != expected:
+                log.warning("skills compound access DENIED (bad/missing X-Skill-Bypass) from %s", ip)
+                return JSONResponse(
+                    {"error": "skills compound requires a valid X-Skill-Bypass token"},
+                    status_code=401,
+                )
 
         try:
             response = await call_next(request)
         finally:
             _client_info.reset(ci_token)
             _incoming_headers.reset(ih_token)
+            _request_path.reset(rp_token)
         return response
 
 
@@ -1264,6 +1279,16 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
 
 
 
+                    # Pre-approved skill calls (skills-ipybox) skip the Telegram
+                    # confirm flow entirely. Deny rules already ran before this point.
+                    _ih = _incoming_headers.get() or {}
+                    _tok = os.environ.get("SKILLS_BYPASS_TOKEN", "")
+                    if (_tok and _ih.get("X-Skill-Bypass") == _tok
+                            and (_request_path.get() or "").rstrip("/") == "/mcp/skills"):
+                        rule_matched = True
+                        log.info("Tool call %s.%s ALLOWED via skill bypass (skill=%s) - skipping confirm",
+                                 bc.name, tn, _ih.get("X-Skill-Name", "unknown"))
+                        break
                     allowance_key = _allowance_key(info, bc.name, rule_index)
                     if _temp_allow_active(allowance_key):
                         # Grant still unexpired — bypass confirm, treat as allow (injections
