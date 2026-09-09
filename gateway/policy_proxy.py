@@ -470,6 +470,13 @@ class TelegramBackend:
         self._offset = 0
         self._running = False
         self._client = httpx.AsyncClient(timeout=10.0)
+        # A permanent auth failure (401/404) means the bot token is invalid or
+        # empty — polling will never succeed, so we stop instead of spamming
+        # api.telegram.org forever (and masking real errors with 404 noise).
+        self._token_error = False
+
+    def stop(self):
+        self._running = False
 
     async def send_approval_request(self, request_id: str, tool_name: str,
                                     arguments: dict, client_info: Optional[ClientInfo],
@@ -550,6 +557,12 @@ class TelegramBackend:
         """Background task: poll Telegram for callback_query responses."""
         self._running = True
         while self._running:
+            if self._token_error:
+                # Bot token is invalid/empty — polling can never succeed.
+                # Stop the loop; restart requires fixing the config.
+                log.warning("Telegram poll_loop stopped: permanent token error (401/404).")
+                self._running = False
+                break
             try:
                 params = {
                     "offset": self._offset,
@@ -571,6 +584,11 @@ class TelegramBackend:
                                 r.status_code,
                                 f" {r.reason_phrase}" if r.reason_phrase else "",
                                 f" — {detail}" if detail else "")
+                    # 401 Unauthorized / 404 Not Found means the bot token is wrong
+                    # or empty. Polling will never succeed, so stop instead of
+                    # spamming forever.
+                    if r.status_code in (401, 404):
+                        self._token_error = True
                     await asyncio.sleep(self.poll_interval)
                     continue
 

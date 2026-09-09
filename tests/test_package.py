@@ -830,3 +830,68 @@ def test_confirm_branch_bypasses_when_allowance_active():
         policy_proxy._incoming_headers.reset(t_hdr)
         policy_proxy._temp_allowances.clear()
         policy_proxy._pending_requests.clear()
+
+
+# ---------------------------------------------------------------------------
+# Regression test for the 2026-09-08 Telegram 404-spam bug.
+#
+# With an empty/wrong bot token, getUpdates returns 404 forever. The poll
+# loop used to log a warning and keep spamming api.telegram.org every 3s
+# indefinitely (masking real errors and burning requests). It must instead
+# detect the permanent 401/404 and stop.
+# ---------------------------------------------------------------------------
+
+import asyncio
+from unittest.mock import patch
+
+import httpx
+
+
+class _MockTransport(httpx.BaseTransport):
+    """Return a fixed non-200 for every getUpdates call."""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        self.calls = 0
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self._respond(request)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
+        return self._respond(request)
+
+    def _respond(self, request: httpx.Request) -> httpx.Response:
+        body = b""
+        if self.status_code == 404:
+            body = b'{"ok":false,"error_code":404,"description":"Not Found"}'
+        elif self.status_code == 401:
+            body = b'{"ok":false,"error_code":401,"description":"Unauthorized"}'
+        return httpx.Response(self.status_code, content=body, request=request)
+
+
+@pytest.mark.asyncio
+async def test_telegram_poll_loop_stops_on_404():
+    """A permanent 404 must stop the poll loop, not spam forever."""
+    backend = policy_proxy.TelegramBackend(bot_token="bad-token", chat_id="123")
+    backend._client = httpx.AsyncClient(transport=_MockTransport(404), timeout=10.0)
+
+    # Run the loop; it should stop itself after the first 404, not spin.
+    await asyncio.wait_for(backend.poll_loop(), timeout=5.0)
+
+    assert backend._token_error is True
+    assert backend._running is False
+    # Only a handful of requests (the one that failed), not an unbounded stream.
+    assert backend._client._transport.calls <= 2
+
+
+@pytest.mark.asyncio
+async def test_telegram_poll_loop_stops_on_401():
+    """A permanent 401 must also stop the poll loop."""
+    backend = policy_proxy.TelegramBackend(bot_token="bad-token", chat_id="123")
+    backend._client = httpx.AsyncClient(transport=_MockTransport(401), timeout=10.0)
+
+    await asyncio.wait_for(backend.poll_loop(), timeout=5.0)
+
+    assert backend._token_error is True
+    assert backend._running is False
