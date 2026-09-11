@@ -1303,6 +1303,10 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     _tok = os.environ.get("SKILLS_BYPASS_TOKEN", "")
                     if (_tok and _ih.get("X-Skill-Bypass") == _tok
                             and (_request_path.get() or "").rstrip("/") == "/mcp/skills"):
+                        # Collect injections from the confirm rule too (e.g., KUBECONFIG
+                        # for kubectl/virtctl) so the tool actually works when bypassed.
+                        if "inject" in rule:
+                            injections.update(resolve_injections(rule["inject"]))
                         rule_matched = True
                         log.info("Tool call %s.%s ALLOWED via skill bypass (skill=%s) - skipping confirm",
                                  bc.name, tn, _ih.get("X-Skill-Name", "unknown"))

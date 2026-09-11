@@ -33,6 +33,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ------------------------------------------------------------------
+# kubectl + virtctl (used by the exec backend for k8s/kubevirt ops)
+# ------------------------------------------------------------------
+ARG KUBECTL_VERSION=1.32.0
+RUN curl -fsSL "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+        -o /usr/local/bin/kubectl && \
+    chmod +x /usr/local/bin/kubectl
+
+ARG VIRTCTL_VERSION=v1.4.0
+RUN curl -fsSL "https://github.com/kubevirt/kubevirt/releases/download/${VIRTCTL_VERSION}/virtctl-${VIRTCTL_VERSION}-linux-amd64" \
+        -o /usr/local/bin/virtctl && \
+    chmod +x /usr/local/bin/virtctl
+
+# ------------------------------------------------------------------
+# pexpect — needed for virtctl console interaction via exec backend
+# ------------------------------------------------------------------
+RUN pip install --no-cache-dir pexpect
+
+# ------------------------------------------------------------------
 # Core python deps
 # ------------------------------------------------------------------
 RUN pip install --no-cache-dir \
