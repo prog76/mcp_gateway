@@ -1073,6 +1073,7 @@ async def discover_from_backend(bc) -> Tuple[List, Optional[str]]:
 async def forward(bc, tool_name, arguments, progress_callback=None):
     if progress_callback is None:
         progress_callback = get_upstream_progress_callback()
+    log.info("PROGRESS-RELAY forward %s: callback=%r", tool_name, progress_callback is not None)
     try:
         if _is_http(bc):
             # Use per-request effective headers if set (by compound handlers),

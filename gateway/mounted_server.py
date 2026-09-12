@@ -137,10 +137,17 @@ class MountedServer:
         log.info("MountedServer '%s': %d allowed hosts, dns_rebinding=%s, strip_output_schema=%s, stateless=%s",
                  name, len(allowed_hosts), enable_dns_rebinding_protection, strip_output_schema, stateless)
 
+        # json_response=False (SSE responses) is REQUIRED for progress relay:
+        # in JSON mode the SDK discards interim notifications emitted during a
+        # tool call and returns only the final response, so progress beats
+        # (e.g. keepalives relayed from skills-ipybox / ipybox) would never
+        # reach the client.  SSE POST responses carry the interim
+        # notifications plus the final response; every client we serve (mcp
+        # python lib, mcp2cli, tg-client) sends Accept including text/event-stream.
         self._http_manager = StreamableHTTPSessionManager(
             app=self._mcp,
             event_store=None,
-            json_response=True,
+            json_response=False,
             stateless=stateless,
             security_settings=self._security,
         )
@@ -183,6 +190,7 @@ class MountedServer:
                 progress_token = None
                 client_session = None
 
+            log.info("PROGRESS-RELAY setup: token=%r", progress_token)
             if progress_token is not None and client_session is not None:
                 async def _relay(
                     progress: float,
@@ -190,16 +198,22 @@ class MountedServer:
                     message: Optional[str],
                 ) -> None:
                     """Relay a progress notification from the backend to the client."""
+                    log.info("PROGRESS-RELAY firing progress=%r msg=%r", progress, message)
                     try:
                         await client_session.send_progress_notification(
                             progress_token=progress_token,
                             progress=progress,
                             total=total,
                             message=message,
+                            # Tag with the incoming tools/call request id so the
+                            # streamable transport routes the notification onto
+                            # that request's SSE response stream; without it the
+                            # transport drops the notification (no standalone GET
+                            # stream association) and the client never sees it.
+                            related_request_id=rc.request_id,
                         )
                     except Exception:
-                        # Best-effort: never let a relay failure break the
-                        # underlying tool call.
+                        log.exception("PROGRESS-RELAY send failed")
                         pass
 
                 callback_token = _upstream_progress_callback.set(_relay)
