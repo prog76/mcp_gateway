@@ -598,67 +598,71 @@ class TelegramBackend:
                     self._offset = update["update_id"] + 1
                     cq = update.get("callback_query")
 
-                    data = cq.get("data", "")
-                    msg = cq.get("message", {})
-                    chat = msg.get("chat", {})
-                    from_user = cq.get("from", {})
+                    if cq:
+                        data = cq.get("data", "")
+                        msg = cq.get("message", {})
+                        chat = msg.get("chat", {})
+                        from_user = cq.get("from", {})
 
-                    # Parse callback data: "approve:<request_id>" or "reject:<request_id>"
-                    parts = data.split(":", 1)
-                    if len(parts) != 2:
-                        continue
+                        # Parse callback data: "approve:<request_id>" or "reject:<request_id>"
+                        parts = data.split(":", 1)
+                        if len(parts) != 2:
+                            # Not an approval callback — try generic ask dispatch
+                            if await self._try_ask_callback(cq, data):
+                                continue
+                            continue
 
-                    action, request_id = parts
-                    pending = _pending_requests.get(request_id)
-                    if not pending:
-                        # Unknown/expired request — acknowledge
-                        await self._answer_callback(cq["id"], "Request expired or unknown")
-                        continue
+                        action, request_id = parts
+                        pending = _pending_requests.get(request_id)
+                        if not pending:
+                            # Unknown/expired request — acknowledge
+                            await self._answer_callback(cq["id"], "Request expired or unknown")
+                            continue
 
-                    if action == "approve":
-                        pending.approved = True
-                        await self._answer_callback(cq["id"], "✅ Approved — executing now")
-                        # Keep original message but update status and remove buttons
-                        original_text = msg.get("text", "")
-                        operator_name = from_user.get('first_name', 'Operator')
-                        status_text = f"Status: approved by {operator_name}\n"
-                        if "Status:" in original_text:
-                            updated_text = re.sub(r"Status:.*\n", status_text, original_text)
+                        if action == "approve":
+                            pending.approved = True
+                            await self._answer_callback(cq["id"], "✅ Approved — executing now")
+                            # Keep original message but update status and remove buttons
+                            original_text = msg.get("text", "")
+                            operator_name = from_user.get('first_name', 'Operator')
+                            status_text = f"Status: approved by {operator_name}\n"
+                            if "Status:" in original_text:
+                                updated_text = re.sub(r"Status:.*\n", status_text, original_text)
+                            else:
+                                updated_text = original_text.rstrip("\n") + "\n\n" + status_text
+                            await self._edit_message(chat["id"], msg["message_id"], updated_text, remove_keyboard=True)
+                        elif action == "allow1m":
+                            # Operator granted a short-lived session-scoped bypass: auto-approve THIS
+                            # exact confirm rule for the remaining window (no re-notification needed).
+                            if pending.client_key and pending.rule_index >= 0:
+                                _temp_allowances[(pending.client_key, pending.backend_name, pending.rule_index)] = time.monotonic() + _TEMP_ALLOW_WINDOW
+                            pending.approved = True
+                            await self._answer_callback(cq["id"], "⏱ Approved for 1 minute (this session) — executing now")
+                            original_text = msg.get("text", "")
+                            operator_name = from_user.get("first_name", "Operator")
+                            status_text = f"Status: approved for 1 min (session) by {operator_name}\n"
+                            if "Status:" in original_text:
+                                updated_text = re.sub(r"Status:.*\n", status_text, original_text)
+                            else:
+                                updated_text = original_text.rstrip("\n") + "\n\n" + status_text
+                            await self._edit_message(chat["id"], msg["message_id"], updated_text, remove_keyboard=True)
+                        elif action == "reject":
+                            pending.approved = False
+                            await self._answer_callback(cq["id"], "❌ Rejected")
+                            # Keep original message but update status and remove buttons
+                            original_text = msg.get("text", "")
+                            operator_name = from_user.get('first_name', 'Operator')
+                            status_text = f"Status: declined by {operator_name}\n"
+                            if "Status:" in original_text:
+                                updated_text = re.sub(r"Status:.*\n", status_text, original_text)
+                            else:
+                                updated_text = original_text.rstrip("\n") + "\n\n" + status_text
+                            await self._edit_message(chat["id"], msg["message_id"], updated_text, remove_keyboard=True)
                         else:
-                            updated_text = original_text.rstrip("\n") + "\n\n" + status_text
-                        await self._edit_message(chat["id"], msg["message_id"], updated_text, remove_keyboard=True)
-                    elif action == "allow1m":
-                        # Operator granted a short-lived session-scoped bypass: auto-approve THIS
-                        # exact confirm rule for the remaining window (no re-notification needed).
-                        if pending.client_key and pending.rule_index >= 0:
-                            _temp_allowances[(pending.client_key, pending.backend_name, pending.rule_index)] = time.monotonic() + _TEMP_ALLOW_WINDOW
-                        pending.approved = True
-                        await self._answer_callback(cq["id"], "⏱ Approved for 1 minute (this session) — executing now")
-                        original_text = msg.get("text", "")
-                        operator_name = from_user.get("first_name", "Operator")
-                        status_text = f"Status: approved for 1 min (session) by {operator_name}\n"
-                        if "Status:" in original_text:
-                            updated_text = re.sub(r"Status:.*\n", status_text, original_text)
-                        else:
-                            updated_text = original_text.rstrip("\n") + "\n\n" + status_text
-                        await self._edit_message(chat["id"], msg["message_id"], updated_text, remove_keyboard=True)
-                    elif action == "reject":
-                        pending.approved = False
-                        await self._answer_callback(cq["id"], "❌ Rejected")
-                        # Keep original message but update status and remove buttons
-                        original_text = msg.get("text", "")
-                        operator_name = from_user.get('first_name', 'Operator')
-                        status_text = f"Status: declined by {operator_name}\n"
-                        if "Status:" in original_text:
-                            updated_text = re.sub(r"Status:.*\n", status_text, original_text)
-                        else:
-                            updated_text = original_text.rstrip("\n") + "\n\n" + status_text
-                        await self._edit_message(chat["id"], msg["message_id"], updated_text, remove_keyboard=True)
-                    else:
-                        continue
+                            continue
 
-                    pending.event.set()
-                    continue
+                        pending.event.set()
+                        continue
 
                 # Generic ask: callback_query with reply:<id> or free-text message
                 if cq and await self._try_ask_callback(cq, data):
