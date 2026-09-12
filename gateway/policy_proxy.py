@@ -46,6 +46,7 @@ from mcp.shared.exceptions import McpError
 from mcp.types import CallToolResult, TextContent
 
 from gateway.mounted_server import MountedServer, get_upstream_progress_callback
+from gateway.telegram_mcp import register_telegram_handlers
 from gateway.policy_yaml import PolicyLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -567,7 +568,7 @@ class TelegramBackend:
                 params = {
                     "offset": self._offset,
                     "timeout": 10,
-                    "allowed_updates": ["callback_query"],
+                    "allowed_updates": ["callback_query", "message"],
                 }
                 r = await self._client.get(f"{self._api_base}/getUpdates", params=params)
                 if r.status_code != 200:
@@ -596,8 +597,6 @@ class TelegramBackend:
                 for update in updates:
                     self._offset = update["update_id"] + 1
                     cq = update.get("callback_query")
-                    if not cq:
-                        continue
 
                     data = cq.get("data", "")
                     msg = cq.get("message", {})
@@ -659,12 +658,31 @@ class TelegramBackend:
                         continue
 
                     pending.event.set()
+                    continue
+
+                # Generic ask: callback_query with reply:<id> or free-text message
+                if cq and await self._try_ask_callback(cq, data):
+                    continue
+                if not cq:
+                    msg = update.get("message")
+                    if msg and await self._try_ask_message(msg):
+                        continue
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.warning("Telegram poll error: %s", e)
                 await asyncio.sleep(self.poll_interval)
+
+    async def _try_ask_callback(self, cq, data: str) -> bool:
+        """Try to resolve a generic ask from a callback_query."""
+        from gateway.telegram_mcp import _dispatch_callback
+        return _dispatch_callback(self, {"callback_query": cq})
+
+    async def _try_ask_message(self, msg: dict) -> bool:
+        """Try to resolve a generic ask from a text message."""
+        from gateway.telegram_mcp import _dispatch_message
+        return _dispatch_message(self, {"message": msg})
 
     async def _answer_callback(self, callback_id: str, text: str):
         try:
@@ -2009,6 +2027,7 @@ async def main():
                 # Start Telegram polling if enabled
                 telegram_poll_task = None
                 if _telegram_backend is not None:
+                    register_telegram_handlers(_telegram_backend)
                     telegram_poll_task = asyncio.create_task(_telegram_backend.poll_loop())
                     log.info("Telegram polling started")
                 yield
