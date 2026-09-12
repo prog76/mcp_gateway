@@ -2031,7 +2031,8 @@ async def main():
                 # Start Telegram polling if enabled
                 telegram_poll_task = None
                 if _telegram_backend is not None:
-                    register_telegram_handlers(_telegram_backend)
+                    pending_asks: dict = {}
+                    register_telegram_handlers(_telegram_backend, pending_asks)
                     telegram_poll_task = asyncio.create_task(_telegram_backend.poll_loop())
                     log.info("Telegram polling started")
                 yield
