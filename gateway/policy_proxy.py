@@ -2031,10 +2031,20 @@ async def main():
                 # Start Telegram polling if enabled
                 telegram_poll_task = None
                 if _telegram_backend is not None:
-                    pending_asks: dict = {}
-                    register_telegram_handlers(_telegram_backend, pending_asks)
-                    telegram_poll_task = asyncio.create_task(_telegram_backend.poll_loop())
-                    log.info("Telegram polling started")
+                    try:
+                        pending_asks: dict = {}
+                        register_telegram_handlers(_telegram_backend, pending_asks)
+                        telegram_poll_task = asyncio.create_task(_telegram_backend.poll_loop())
+                        log.info("Telegram polling started")
+                    except Exception:
+                        # Startup wiring errors (e.g. signature drift between
+                        # register_telegram_handlers and its call site) must surface
+                        # HERE with a clear message — not buried as the innermost
+                        # exception of an ExceptionGroup raised by the MCP SDK's
+                        # task group, which misleadingly points at upstream code.
+                        log.exception("Telegram startup failed — check register_telegram_handlers signature")
+                        await _telegram_backend.shutdown()
+                        raise
                 yield
                 watchdog_task.cancel()
                 try:
