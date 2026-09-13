@@ -963,39 +963,92 @@ def test_install_telegram_tools_signature():
     assert params[1].name == "backend"
 
 
-def test_lifespan_wiring_calls_install_with_server_and_backend(monkeypatch):
-    """Verify the lifespan wiring passes a MountedServer plus the backend.
+def test_telegram_mount_registered_before_starlette_construction():
+    """Regression: the /mcp/telegram Mount must be added to all_routes BEFORE
+    Starlette(routes=all_routes) is constructed.
 
-    Mocks _telegram_backend and intercepts install_telegram_tools to confirm
-    it's called with (MountedServer, backend) — mirroring the telegram branch
-    of policy_proxy.lifespan, since the closure isn't directly importable.
+    Starlette's Router copies the routes list (self.routes = list(routes)), so
+    a Mount appended inside lifespan() — after construction — never takes
+    effect and /mcp/telegram silently 404s. This test fails if anyone moves
+    the install_telegram_tools/Mount wiring back below the Starlette(...) call.
     """
-    from unittest.mock import MagicMock, patch
+    import inspect
 
-    from gateway import policy_proxy as pp
-    from gateway.mounted_server import MountedServer
+    from gateway import policy_proxy
 
-    fake_backend = MagicMock()
-    captured = {}
-
-    def fake_install(server, backend):
-        captured["server"] = server
-        captured["backend"] = backend
-
-    monkeypatch.setattr(pp, "_telegram_backend", fake_backend)
-    with patch("gateway.telegram_mcp.install_telegram_tools", side_effect=fake_install):
-        # Mirror the telegram branch of lifespan():
-        _tg_server = MountedServer(
-            name="telegram", port=8000, allowed_hosts=["*"])
-        pp.telegram_mcp.install_telegram_tools(_tg_server, pp._telegram_backend)
-
-    assert "server" in captured, "install_telegram_tools was never called"
-    assert "backend" in captured, (
-        "install_telegram_tools called without backend — "
-        "this is exactly the bug shape that caused the earlier crash loop"
+    src = inspect.getsource(policy_proxy.main)
+    install_pos = src.find("install_telegram_tools(")
+    mount_pos = src.find('"/mcp/telegram"')
+    starlette_pos = src.find("starlette_app = Starlette(routes=all_routes)")
+    assert install_pos != -1, "install_telegram_tools call vanished from main()"
+    assert mount_pos != -1, 'Mount("/mcp/telegram", ...) vanished from main()'
+    assert starlette_pos != -1, "Starlette construction vanished from main()"
+    assert install_pos < starlette_pos and mount_pos < starlette_pos, (
+        "telegram install/Mount wiring must appear BEFORE "
+        "Starlette(routes=all_routes) in main() — Router copies the routes "
+        "list, so appending inside lifespan() silently 404s /mcp/telegram"
     )
-    assert isinstance(captured["server"], MountedServer)
-    assert captured["backend"] is fake_backend
+
+
+def test_lifespan_starts_telegram_http_manager():
+    """The telegram server's StreamableHTTP session manager must be started
+    in lifespan together with the other mounted servers.
+
+    Without _http_manager.run() being entered for tg_server, requests to
+    /mcp/telegram fail with "Task group is not initialized. Make sure to use
+    run()." even when the route itself is registered correctly.
+    """
+    import inspect
+
+    from gateway import policy_proxy
+
+    src = inspect.getsource(policy_proxy.main)
+    lines = src.splitlines()
+    idx = next(
+        i for i, l in enumerate(lines)
+        if "enter_async_context(server._http_manager.run())" in l
+    )
+    for_line = next(
+        l.strip() for l in reversed(lines[:idx])
+        if l.strip().startswith("for server in")
+    )
+    assert "tg_server" in for_line, (
+        "the lifespan _http_manager.run() loop must include tg_server — "
+        "otherwise /mcp/telegram requests fail with 'Task group is not "
+        "initialized'"
+    )
+
+
+def test_poll_loop_ask_dispatch_is_per_update():
+    """The generic-ask dispatch must run per update INSIDE the update loop.
+
+    Previously the ask/message dispatch sat AFTER `for update in updates:` and
+    read the last update's `cq`/`update`, which (a) raised
+    UnboundLocalError('cq') on idle polls with an empty update batch, (b) only
+    processed message replies when the LAST update wasn't a callback, and
+    (c) re-dispatched ask callbacks that were already handled in-loop.
+    """
+    import inspect
+
+    from gateway import policy_proxy
+
+    src = inspect.getsource(policy_proxy.TelegramBackend.poll_loop)
+    lines = src.splitlines()
+    for_idx = next(i for i, l in enumerate(lines) if "for update in updates:" in l)
+    loop_indent = len(lines[for_idx]) - len(lines[for_idx].lstrip())
+    body_indent = loop_indent + 4
+    ask_idx = next(i for i, l in enumerate(lines) if "_try_ask_message" in l)
+    assert ask_idx > for_idx, "_try_ask_message dispatch missing from poll_loop"
+    assert (len(lines[ask_idx]) - len(lines[ask_idx].lstrip())) == body_indent, (
+        "_try_ask_message dispatch must be inside the update loop (body indent)"
+    )
+    assert not any("_try_ask_message" in l for l in lines[ask_idx + 1:]), (
+        "duplicate post-loop ask dispatch — callbacks would be double-dispatched"
+    )
+    assert "if not cq:" not in src, (
+        "post-loop 'if not cq:' block is back — that reads the last update's "
+        "cq and raises UnboundLocalError on idle polls"
+    )
 
 
 # ---------------------------------------------------------------------------

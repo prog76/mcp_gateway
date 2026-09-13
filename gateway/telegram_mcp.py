@@ -121,7 +121,10 @@ async def _tool_ask(**kw) -> str:
     return pending.answer if pending.answer is not None else "OK: ask posted"
 
 
-def _tool_status(**kw) -> str:
+async def _tool_status(**kw) -> str:
+    # NOTE: must be a coroutine — MountedServer.call_tool awaits every tool
+    # handler, so a sync def here fails with "object str can't be used in
+    # 'await' expression" at tools/call time.
     backend = _installed_backend
     if backend is None:
         return "telegram: not configured"

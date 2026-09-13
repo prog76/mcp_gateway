@@ -684,10 +684,11 @@ class TelegramBackend:
                         pending.event.set()
                         continue
 
-                # Generic ask: callback_query with reply:<id> or free-text message
-                if cq and await self._try_ask_callback(cq, data):
-                    continue
-                if not cq:
+                    # Generic ask: free-text message replies (ask_user flow).
+                    # Must run per update INSIDE the loop — a post-loop block
+                    # would only see the LAST update (raising UnboundLocalError
+                    # 'cq' on idle polls with an empty update batch) and skip
+                    # messages whenever the last update was a callback.
                     msg = update.get("message")
                     if msg and await self._try_ask_message(msg):
                         continue
@@ -2036,6 +2037,19 @@ async def main():
             all_routes.append(Mount(compound.path, app=compound_app))
             log.info("Mounted compound '%s' at %s", compound.name, compound.path)
 
+        # Mount the telegram tools server (an in-process "virtual backend") BEFORE
+        # Starlette construction: Router.__init__ copies the routes list, so a
+        # Mount appended later (e.g. from inside lifespan) silently 404s. Its
+        # StreamableHTTP session manager is started in lifespan() below, together
+        # with the other mounted servers.
+        tg_server = None
+        if _telegram_backend is not None:
+            tg_server = MountedServer(
+                name="telegram", port=http_port, allowed_hosts=allowed_hosts)
+            telegram_mcp.install_telegram_tools(tg_server, _telegram_backend)
+            all_routes.append(Mount("/mcp/telegram", app=tg_server.get_app()))
+            log.info("Telegram tools mounted at /mcp/telegram")
+
         starlette_app = Starlette(routes=all_routes)
         starlette_app.add_middleware(ClientInfoMiddleware)
 
@@ -2045,7 +2059,9 @@ async def main():
                 # Initialize _http_manager (StreamableHTTPSessionManager) for MountedServer
                 # instances only. FastMCP browser compounds (_AppWrapper) manage their own
                 # transport internally and don't need _http_manager.run().
-                for server in mounted_servers + compound_servers:
+                # tg_server may be None (telegram disabled) — the hasattr guard
+                # skips it, same as FastMCP compound servers without one.
+                for server in [*mounted_servers, *compound_servers, tg_server]:
                     if hasattr(server, "_http_manager"):
                         await stack.enter_async_context(server._http_manager.run())
                 # Start discovery watchdog for unhealthy backends
@@ -2054,25 +2070,17 @@ async def main():
                 telegram_poll_task = None
                 if _telegram_backend is not None:
                     try:
-                        pending_asks: dict = {}
-                        # telegram tools installed via install_telegram_tools below
                         telegram_poll_task = asyncio.create_task(_telegram_backend.poll_loop())
                         log.info("Telegram polling started")
                     except Exception:
                         # Startup wiring errors (e.g. signature drift between
-                        # register_telegram_handlers and its call site) must surface
+                        # install_telegram_tools and TelegramBackend) must surface
                         # HERE with a clear message — not buried as the innermost
                         # exception of an ExceptionGroup raised by the MCP SDK's
                         # task group, which misleadingly points at upstream code.
-                        log.exception("Telegram startup failed — check register_telegram_handlers signature")
+                        log.exception("Telegram startup failed — check install_telegram_tools wiring")
                         await _telegram_backend.shutdown()
                         raise
-
-                    _tg_server = MountedServer(
-                        name="telegram", port=http_port, allowed_hosts=allowed_hosts)
-                    telegram_mcp.install_telegram_tools(_tg_server, _telegram_backend)
-                    all_routes.append(Mount("/mcp/telegram", app=_tg_server.get_app()))
-                    log.info("Telegram tools mounted at /mcp/telegram")
                 yield
                 watchdog_task.cancel()
                 try:

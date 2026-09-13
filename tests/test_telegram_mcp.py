@@ -50,14 +50,28 @@ def fake_backend():
 class TestConfiguration:
     def test_status_not_configured(self):
         tm._installed_backend = None
-        assert tm._tool_status() == "telegram: not configured"
+        assert asyncio.run(tm._tool_status()) == "telegram: not configured"
 
     def test_status_configured_no_pending(self, fake_backend):
         tm._installed_backend = fake_backend
-        out = tm._tool_status()
+        out = asyncio.run(tm._tool_status())
         assert "configured" in out
         assert "chat_id 12345" in out
         assert "pending asks: 0" in out
+
+    def test_all_tool_handlers_are_async(self):
+        """MountedServer.call_tool does `await handler(**arguments)` — a sync
+        handler returns a str and blows up with "object str can't be used in
+        'await' expression" at tools/call time. Every TOOL_SPECS handler must
+        therefore be a coroutine function.
+        """
+        import inspect
+
+        for spec in tm.TOOL_SPECS:
+            assert inspect.iscoroutinefunction(spec["handler"]), (
+                f"{spec['name']} handler must be async — MountedServer awaits "
+                "tool handlers"
+            )
 
     def test_install_wires_backend_and_tools(self, fake_backend):
         server = MagicMock()
