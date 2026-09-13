@@ -1322,6 +1322,20 @@ async def _run_confirm_progress_ticker(relay, request_id: str, timeout: int,
             break
 
 
+def _error_result(text: str) -> CallToolResult:
+    """Return an ``isError`` CallToolResult for policy-failure exits.
+
+    A bare string return from a policy handler is wrapped by MountedServer as a
+    *successful* result with no structured content. For tools that advertise an
+    outputSchema (e.g. GitLab ``create_branch``/``create_commit``) the MCP SDK
+    client then fails validation with "Tool ... has an output schema but did not
+    return structured content" — masking the real reason (denial, timeout, ...).
+    Marking the result as an error skips client-side structured-content
+    validation and surfaces the actual message.
+    """
+    return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
+
+
 def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
     """Create a handler function for a tool with policy enforcement.
 
@@ -1395,7 +1409,9 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         log.info("Tool call %s.%s ALLOWED via operator 1-min session allowance(rule idx %d) - skipping confirm", bc.name, tn, rule_index)
                         break
                     if _telegram_backend is None:
-                        return "ACCESS DENIED: confirm action requires a notification backend (none configured)"
+                        return _error_result(
+                            "ACCESS DENIED: confirm action requires a notification backend (none configured)"
+                        )
 
                     request_id = str(uuid.uuid4())
                     pending = PendingRequest(request_id=request_id)
@@ -1453,7 +1469,9 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     )
                     if not sent:
                         _pending_requests.pop(request_id, None)
-                        return "ACCESS DENIED: Failed to send approval request to operator"
+                        return _error_result(
+                            "ACCESS DENIED: Failed to send approval request to operator"
+                        )
 
                     # Optional: send periodic MCP progress notifications to the
                     # agent while we await the operator's decision (only when the
@@ -1477,7 +1495,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         # Edit the Telegram message to show timed out status
                         await _telegram_backend.edit_request_timeout(request_id)
                         _pending_requests.pop(request_id, None)
-                        return timeout_template
+                        return _error_result(timeout_template)
 
                     _stop_ticker()
                     _pending_requests.pop(request_id, None)
@@ -1491,7 +1509,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                                     total=float(timeout),
                                     message=f"❌ Operator declined the approval request ({request_id[:8]}…)",
                                 )
-                        return denied_template
+                        return _error_result(denied_template)
 
                     # Operator approved — forward to real backend
                     if injections:
@@ -1499,14 +1517,30 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
 
                     result = await forward(bc, tn, kw)
                     if "error" in result:
-                        return f"Error: {result['error']}"
+                        return _error_result(f"Error: {result['error']}")
 
-                    result_text = result.get("content", [""])[0]
+                    result_text = (result.get("content") or [""])[0]
+                    structured = result.get("structuredContent")
+                    is_error = result.get("isError", False)
                     # Resolve approved template with ${result}
-                    return resolve_template(
+                    rendered = resolve_template(
                         approved_template, tn,
                         {**policy_kw, "result": result_text},
                     )
+                    # Preserve the upstream structured content + isError end-to-end.
+                    # Returning a plain str here makes the MCP SDK client fail an
+                    # outputSchema-typed tool (e.g. GitLab create_branch/create_commit)
+                    # with "Tool ... has an output schema but did not return structured
+                    # content" even though the upstream call succeeded.
+                    if structured is not None:
+                        return CallToolResult(
+                            content=[TextContent(type="text", text=rendered)],
+                            structuredContent=structured,
+                            isError=is_error,
+                        )
+                    if is_error:
+                        return _error_result(rendered)
+                    return rendered
 
                 else:
                     # Unknown action — treat as allow

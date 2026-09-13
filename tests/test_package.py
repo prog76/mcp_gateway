@@ -749,6 +749,116 @@ def test_confirm_emits_progress_notifications():
     assert "approved-ok" in out
 
 
+def _run_confirm(approved, upstream=None, tool="gitlab_create_branch"):
+    """Run the confirm branch of make_policy_handler to completion.
+
+    Simulates the operator's Telegram decision (``approved=True/False``) on the
+    pending request and returns the handler's result.
+    """
+    bc = policy_proxy.BackendConfig(name="gitlab", url="http://gitlab/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="gitlab", healthy=True)
+    rules = [
+        {
+            "match": {"tool": ".*"},
+            "action": "confirm",
+            "timeout": 30,
+        }
+    ]
+
+    class FakeTelegramBackend:
+        async def send_approval_request(self, **kw):
+            return True
+
+        async def edit_request_timeout(self, request_id):
+            pass
+
+    orig_tg = policy_proxy._telegram_backend
+    orig_forward = policy_proxy.forward
+
+    async def fake_forward(bc, tool_name, arguments):
+        if upstream is None:
+            raise AssertionError("forward() was called without an upstream stub")
+        return upstream
+
+    async def scenario():
+        policy_proxy._telegram_backend = FakeTelegramBackend()
+        policy_proxy.forward = fake_forward
+        handler = policy_proxy.make_policy_handler(bc, rules, tool, status)
+        task = asyncio.create_task(
+            handler(project_path="sysadm/devops/kubernetes/helm/ls-vm-chart",
+                    branch="feature/add-initial-chart", ref="main")
+        )
+        for _ in range(500):
+            if policy_proxy._pending_requests:
+                break
+            await asyncio.sleep(0.01)
+        assert policy_proxy._pending_requests, "confirm never created a pending request"
+        _rid, pending = next(iter(policy_proxy._pending_requests.items()))
+        pending.approved = approved
+        pending.event.set()
+        return await task
+
+    try:
+        return asyncio.run(scenario())
+    finally:
+        policy_proxy._telegram_backend = orig_tg
+        policy_proxy.forward = orig_forward
+        policy_proxy._pending_requests.clear()
+
+
+def test_confirm_approved_preserves_structured_content():
+    """Approved confirm for an outputSchema-typed tool must carry the upstream
+    structuredContent through to the client.
+
+    Regression for "RuntimeError: Tool gitlab_create_branch has an output schema
+    but did not return structured content": the confirm branch used to render
+    the approved template to a plain str and drop structuredContent/isError.
+    """
+    upstream = {
+        "content": ["Branch 'feature/add-initial-chart' created"],
+        "structuredContent": {
+            "name": "feature/add-initial-chart",
+            "web_url": "https://gitlab.example/sysadm/devops/kubernetes/helm/ls-vm-chart/-/branches/feature/add-initial-chart",
+        },
+        "isError": False,
+    }
+    out = _run_confirm(approved=True, upstream=upstream)
+    assert isinstance(out, CallToolResult)
+    assert out.isError is False
+    assert out.structuredContent == upstream["structuredContent"]
+    assert "Operator approved" in out.content[0].text
+    assert "created" in out.content[0].text
+
+
+def test_confirm_approved_upstream_error_keeps_is_error():
+    """If the upstream call fails after approval (e.g. a GitLab API error), the
+    handler must surface an errored result — the previous plain-string return
+    was read as a success and, for outputSchema tools, collapsed into the SDK's
+    "did not return structured content" RuntimeError that masked the real error.
+    """
+    upstream = {
+        "content": ["Error: Branch 'main' not found"],
+        "structuredContent": None,
+        "isError": True,
+    }
+    out = _run_confirm(approved=True, upstream=upstream)
+    assert isinstance(out, CallToolResult)
+    assert out.isError is True
+    assert "Branch 'main' not found" in out.content[0].text
+
+
+def test_confirm_denied_returns_error_result():
+    """An operator decline must surface as an isError result. A plain string
+    would be wrapped by MountedServer as a *successful* result, and for
+    outputSchema-typed tools it would trigger the SDK's "did not return
+    structured content" RuntimeError instead of showing the decline reason.
+    """
+    out = _run_confirm(approved=False, upstream=None)
+    assert isinstance(out, CallToolResult)
+    assert out.isError is True
+    assert "ACCESS DENIED" in out.content[0].text
+
+
 def test_allowance_key_requires_session():
     """_allowance_key returns None when no Mcp-Session-Id is present."""
 
