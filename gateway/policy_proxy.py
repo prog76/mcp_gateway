@@ -561,6 +561,38 @@ class TelegramBackend:
             log.error("Telegram sendMessage error: %s", e)
             return False
 
+    async def send_message(self, text, parse_mode=None, reply_markup=None):
+        """Post a sendMessage to the operator chat.
+
+        Returns the shape telegram_mcp tool handlers rely on:
+        {"ok": bool, "message_id": int|None, "chat_id": int|None} — _tool_send
+        checks .ok, _tool_ask stores .message_id/.chat_id for later reply
+        edits. reply_markup is a pre-serialized inline-keyboard JSON string,
+        exactly like send_approval_request builds it.
+        """
+        payload = {"chat_id": self.chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        try:
+            r = await self._client.post(f"{self._api_base}/sendMessage", json=payload)
+            if r.status_code != 200:
+                log.error("Telegram sendMessage failed: %s %s", r.status_code, r.text)
+                return {"ok": False}
+            result = r.json()
+            if not result.get("ok"):
+                log.error("Telegram sendMessage API error: %s",
+                          result.get("description", r.text))
+                return {"ok": False}
+            msg = result.get("result", {})
+            return {"ok": True,
+                    "message_id": msg.get("message_id"),
+                    "chat_id": (msg.get("chat") or {}).get("id")}
+        except Exception as e:
+            log.error("Telegram sendMessage error: %s", e)
+            return {"ok": False}
+
     async def _tg_send(self, text, parse_mode=None, reply_markup=None):
         """Thin wrapper so telegram_mcp tools can send via this backend."""
         return await self.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)

@@ -11,6 +11,8 @@ Covers:
 """
 
 import asyncio
+import httpx
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -175,3 +177,94 @@ class TestDispatchMessage:
         update = {"message": {"text": "  {@reply:live-id-003}  "}}
         assert tm._dispatch_message(fake_backend, update) is True
         assert pending.answer == "(empty reply)"
+
+
+# ---------------------------------------------------------------------------
+# REAL TelegramBackend send path (regression: _tg_send → missing send_message)
+# ---------------------------------------------------------------------------
+
+class TestTelegramBackendSendMessage:
+    """Regression: _tg_send called self.send_message(), a method that never
+    existed on TelegramBackend (the real sendMessage POST lived inline in
+    send_approval_request), so every telegram_send/telegram_ask MCP call died
+    with "'TelegramBackend' object has no attribute 'send_message'". The
+    fake_backend fixture mocks _tg_send itself and could not catch this —
+    these tests exercise the REAL backend over a mocked httpx transport.
+    """
+
+    def _backend(self, responder):
+        from gateway.policy_proxy import TelegramBackend
+
+        be = TelegramBackend("test-token", "-1002309067089")
+        asyncio.run(be._client.aclose())  # close the real client we replace
+        be._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+        return be
+
+    def test_tg_send_returns_ok_shape(self):
+        def responder(request: httpx.Request) -> httpx.Response:
+            assert request.url.path.endswith("/sendMessage")
+            body = json.loads(request.content)
+            assert body["chat_id"] == "-1002309067089"
+            assert body["text"] == "hello"
+            return httpx.Response(200, json={"ok": True, "result": {
+                "message_id": 42, "chat": {"id": -1002309067089}}})
+
+        be = self._backend(responder)
+        out = asyncio.run(be._tg_send("hello"))
+        assert out == {"ok": True, "message_id": 42, "chat_id": -1002309067089}
+
+    def test_tg_send_passes_parse_mode_and_markup(self):
+        seen = {}
+
+        def responder(request: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True, "result": {
+                "message_id": 1, "chat": {"id": 1}}})
+
+        be = self._backend(responder)
+        asyncio.run(be._tg_send("x", parse_mode="HTML",
+                                reply_markup=json.dumps({"inline_keyboard": []})))
+        assert seen["parse_mode"] == "HTML"
+        assert seen["reply_markup"] == '{"inline_keyboard": []}'
+
+    def test_tg_send_api_error_is_ok_false(self):
+        be = self._backend(
+            lambda req: httpx.Response(200, json={"ok": False, "description": "chat not found"}))
+        assert asyncio.run(be._tg_send("x")) == {"ok": False}
+
+    def test_tg_send_http_error_is_ok_false(self):
+        be = self._backend(lambda req: httpx.Response(500, text="boom"))
+        assert asyncio.run(be._tg_send("x")) == {"ok": False}
+
+    def test_tool_send_end_to_end_via_real_backend(self):
+        def responder(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ok": True, "result": {
+                "message_id": 7, "chat": {"id": -1002309067089}}})
+
+        tm._installed_backend = self._backend(responder)
+        out = asyncio.run(tm._tool_send(text="hello"))
+        assert out == "OK: message sent (5 chars)"
+
+    def test_tool_ask_send_path_via_real_backend_then_timeout(self):
+        def responder(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ok": True, "result": {
+                "message_id": 8, "chat": {"id": -1002309067089}}})
+
+        tm._installed_backend = self._backend(responder)
+        # timeout=0 → wait_for raises TimeoutError right after the send,
+        # proving the ask path reaches sendMessage without AttributeError.
+        out = asyncio.run(tm._tool_ask(text="pick one", timeout=0))
+        assert out.startswith("Timeout: no answer within 0s")
+
+    def test_backend_api_surface_matches_tool_handlers(self):
+        """telegram_mcp handlers duck-type these members on the backend; any
+        rename/removal breaks every telegram MCP tool at call time."""
+        import inspect
+
+        from gateway.policy_proxy import TelegramBackend
+
+        be = TelegramBackend("t", "1")
+        for name in ("send_message", "_tg_send", "_answer_callback", "_edit_message"):
+            assert inspect.iscoroutinefunction(getattr(be, name)), name
+        assert be._tg_chat_id == "1"
+        asyncio.run(be._client.aclose())
