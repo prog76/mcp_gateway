@@ -938,66 +938,64 @@ async def test_telegram_poll_loop_stops_on_401():
     assert backend._running is False
 # ---------------------------------------------------------------------------
 # Startup wiring contract tests — prevent signature drift between
-# register_telegram_handlers() and its call site in lifespan().
+# install_telegram_tools() and its call site in lifespan().
 # ---------------------------------------------------------------------------
 
-def test_register_telegram_handlers_signature():
-    """The function must accept exactly (backend, pending_asks).
+def test_install_telegram_tools_signature():
+    """install_telegram_tools must accept exactly (server, backend).
 
-    If a contributor adds/removes a parameter to register_telegram_handlers
+    If a contributor adds/removes a parameter to install_telegram_tools
     but forgets to update the call site in policy_proxy.lifespan, this test
     fails — instead of discovering it via a crash-looping container.
     """
     import inspect
 
-    from gateway.telegram_mcp import register_telegram_handlers
+    from gateway.telegram_mcp import install_telegram_tools
 
-    sig = inspect.signature(register_telegram_handlers)
+    sig = inspect.signature(install_telegram_tools)
     params = list(sig.parameters.values())
     assert len(params) == 2, (
-        f"register_telegram_handlers now takes {len(params)} params "
+        f"install_telegram_tools now takes {len(params)} params "
         f"({[p.name for p in params]}); update the call site in "
         "policy_proxy.lifespan AND this test"
     )
-    assert params[0].name == "backend"
-    assert params[1].name == "pending_asks"
+    assert params[0].name == "server"
+    assert params[1].name == "backend"
 
 
-def test_lifespan_calls_register_with_two_args(monkeypatch):
-    """Verify the lifespan wiring passes both required arguments.
+def test_lifespan_wiring_calls_install_with_server_and_backend(monkeypatch):
+    """Verify the lifespan wiring passes a MountedServer plus the backend.
 
-    Mocks _telegram_backend and intercepts register_telegram_handlers to
-    confirm it's called with (backend, pending_asks) — not just (backend).
+    Mocks _telegram_backend and intercepts install_telegram_tools to confirm
+    it's called with (MountedServer, backend) — mirroring the telegram branch
+    of policy_proxy.lifespan, since the closure isn't directly importable.
     """
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import MagicMock, patch
 
     from gateway import policy_proxy as pp
+    from gateway.mounted_server import MountedServer
 
     fake_backend = MagicMock()
-    fake_backend.poll_loop = AsyncMock()
+    captured = {}
 
-    captured_args = {}
-    assert True  # documentation-only test
-
-    def fake_register(backend, pending_asks):
-        captured_args["backend"] = backend
-        captured_args["pending_asks"] = pending_asks
+    def fake_install(server, backend):
+        captured["server"] = server
+        captured["backend"] = backend
 
     monkeypatch.setattr(pp, "_telegram_backend", fake_backend)
-    with patch("gateway.policy_proxy.register_telegram_handlers", side_effect=fake_register):
-        # Simulate the telegram branch of lifespan() — extract the logic
-        # inline since the closure isn't directly importable.
-        if pp._telegram_backend is not None:
-            pending_asks: dict[str, object] = {}
-            pp.register_telegram_handlers(pp._telegram_backend, pending_asks)
+    with patch("gateway.telegram_mcp.install_telegram_tools", side_effect=fake_install):
+        # Mirror the telegram branch of lifespan():
+        _tg_server = MountedServer(
+            name="telegram", port=8000, allowed_hosts=["*"])
+        pp.telegram_mcp.install_telegram_tools(_tg_server, pp._telegram_backend)
 
-    assert "backend" in captured_args, "register_telegram_handlers was never called"
-    assert "pending_asks" in captured_args, (
-        "register_telegram_handlers called without pending_asks — "
-        "this is exactly the bug that caused the crash loop"
+    assert "server" in captured, "install_telegram_tools was never called"
+    assert "backend" in captured, (
+        "install_telegram_tools called without backend — "
+        "this is exactly the bug shape that caused the earlier crash loop"
     )
-    assert captured_args["backend"] is fake_backend
-    assert isinstance(captured_args["pending_asks"], dict)
+    assert isinstance(captured["server"], MountedServer)
+    assert captured["backend"] is fake_backend
 
 
 # ---------------------------------------------------------------------------

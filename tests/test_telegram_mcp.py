@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for gateway.telegram_mcp — the generic Telegram messaging MCP server.
+"""Tests for gateway.telegram_mcp — Telegram tool handlers + dispatch helpers.
 
 Covers:
-- module imports (no token configured) -> status() reports not configured
+- _tool_status() reports "not configured" until install_telegram_tools wires a backend
 - _find_ask_id parsing for both button callbacks and {@reply:..} free-text tags
 - _dispatch_callback resolves a pending ask when the operator taps a button
 - _dispatch_message resolves a pending ask when the operator replies with text
@@ -27,22 +27,19 @@ from gateway import telegram_mcp as tm
 @pytest.fixture(autouse=True)
 def reset_state():
     tm._pending_asks.clear()
-    tm._backend = None
-    tm._ask_timeout = 120
-    tm._max_choices = 6
+    tm._installed_backend = None
     yield
     tm._pending_asks.clear()
-    tm._backend = None
+    tm._installed_backend = None
 
 
 @pytest.fixture
 def fake_backend():
     b = MagicMock()
-    b.bot_token = "test-token"
-    b.chat_id = "12345"
-    b.send_message = AsyncMock(return_value={"ok": True, "chat_id": 12345, "message_id": 99})
-    b.answer_callback = AsyncMock()
-    b.edit_message = AsyncMock()
+    b._tg_chat_id = "12345"
+    b._tg_send = AsyncMock(return_value={"ok": True, "chat_id": 12345, "message_id": 99})
+    b._answer_callback = AsyncMock()
+    b._edit_message = AsyncMock()
     return b
 
 
@@ -52,23 +49,22 @@ def fake_backend():
 
 class TestConfiguration:
     def test_status_not_configured(self):
-        tm._backend = None
-        assert tm.status() == "telegram: not configured"
+        tm._installed_backend = None
+        assert tm._tool_status() == "telegram: not configured"
 
     def test_status_configured_no_pending(self, fake_backend):
-        tm._backend = fake_backend
-        out = tm.status()
+        tm._installed_backend = fake_backend
+        out = tm._tool_status()
         assert "configured" in out
         assert "chat_id 12345" in out
         assert "pending asks: 0" in out
 
-    def test_configure_sets_backend(self, fake_backend):
-        tm.configure("t", "c", ask_timeout=30, max_choices=4)
-        assert tm._backend is not None
-        assert tm._backend.bot_token == "t"
-        assert tm._backend.chat_id == "c"
-        assert tm._ask_timeout == 30
-        assert tm._max_choices == 4
+    def test_install_wires_backend_and_tools(self, fake_backend):
+        server = MagicMock()
+        tm.install_telegram_tools(server, fake_backend)
+        assert tm._installed_backend is fake_backend
+        registered = [c.kwargs.get("name") for c in server.tool.call_args_list]
+        assert registered == ["telegram_send", "telegram_ask", "telegram_status"]
 
 
 # ---------------------------------------------------------------------------

@@ -50,7 +50,7 @@ from gateway.mounted_server import (
     get_current_session_key,
     get_upstream_progress_callback,
 )
-from gateway.telegram_mcp import register_telegram_handlers
+import gateway.telegram_mcp as telegram_mcp
 from gateway.policy_yaml import PolicyLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -561,6 +561,14 @@ class TelegramBackend:
             log.error("Telegram sendMessage error: %s", e)
             return False
 
+    async def _tg_send(self, text, parse_mode=None, reply_markup=None):
+        """Thin wrapper so telegram_mcp tools can send via this backend."""
+        return await self.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+    @property
+    def _tg_chat_id(self):
+        return self.chat_id
+
     async def poll_loop(self):
         """Background task: poll Telegram for callback_query responses."""
         self._running = True
@@ -577,7 +585,12 @@ class TelegramBackend:
                     "timeout": 10,
                     "allowed_updates": ["callback_query", "message"],
                 }
-                r = await self._client.get(f"{self._api_base}/getUpdates", params=params)
+                # Per-request read timeout must exceed the Telegram long-poll
+                # timeout (10s): with client default 10.0s the read times out
+                # at the same moment the long-poll returns, producing a
+                # spurious ReadTimeout (empty message) on every idle poll.
+                r = await self._client.get(f"{self._api_base}/getUpdates", params=params,
+                                           timeout=httpx.Timeout(15.0))
                 if r.status_code != 200:
                     # Surface Telegram's real error instead of silently looping.
                     # A 409 Conflict here ("Conflict: terminated by other
@@ -2042,7 +2055,7 @@ async def main():
                 if _telegram_backend is not None:
                     try:
                         pending_asks: dict = {}
-                        register_telegram_handlers(_telegram_backend, pending_asks)
+                        # telegram tools installed via install_telegram_tools below
                         telegram_poll_task = asyncio.create_task(_telegram_backend.poll_loop())
                         log.info("Telegram polling started")
                     except Exception:
@@ -2054,6 +2067,12 @@ async def main():
                         log.exception("Telegram startup failed — check register_telegram_handlers signature")
                         await _telegram_backend.shutdown()
                         raise
+
+                    _tg_server = MountedServer(
+                        name="telegram", port=http_port, allowed_hosts=allowed_hosts)
+                    telegram_mcp.install_telegram_tools(_tg_server, _telegram_backend)
+                    all_routes.append(Mount("/mcp/telegram", app=_tg_server.get_app()))
+                    log.info("Telegram tools mounted at /mcp/telegram")
                 yield
                 watchdog_task.cancel()
                 try:
