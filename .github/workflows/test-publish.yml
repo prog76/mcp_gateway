@@ -75,3 +75,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Pin the pip-installed gateway package to the release tag, not
+          # whatever main points at when the build runs (Dockerfile default).
+          build-args: |
+            GATEWAY_VERSION=${{ github.ref_name }}
