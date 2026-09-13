@@ -45,7 +45,11 @@ from mcp import ClientSession
 from mcp.shared.exceptions import McpError
 from mcp.types import CallToolResult, TextContent
 
-from gateway.mounted_server import MountedServer, get_upstream_progress_callback
+from gateway.mounted_server import (
+    MountedServer,
+    get_current_session_key,
+    get_upstream_progress_callback,
+)
 from gateway.telegram_mcp import register_telegram_handlers
 from gateway.policy_yaml import PolicyLoader
 
@@ -344,14 +348,14 @@ class PendingRequest:
 _pending_requests: Dict[str, PendingRequest] = {}
 
 # ---------------------------------------------------------------------------
-# 1-minute "allow for this session" confirm bypass
+# 10-minute "allow for this session" confirm bypass
 # ---------------------------------------------------------------------------
-# Operators can grant ONE confirm rule a short-lived (default 60s) allowance,
+# Operators can grant ONE confirm rule a long-lived (default 600s) allowance,
 # scoped to a single MCP session + client connection. While an allowance is
 # active, that exact rule short-circuits the Telegram confirm flow (no notification).
 # Keyed by: ((session-scoped client_key, backend_name, rule_index) -> monotonic expiry.
 
-_TEMP_ALLOW_WINDOW = float(os.environ.get("MCP_TEMP_ALLOW_SECONDS", "60"))
+_TEMP_ALLOW_WINDOW = float(os.environ.get("MCP_TEMP_ALLOW_SECONDS", "600"))
 _temp_allowances: Dict[Tuple[str, str, int], float] = {}
 
 
@@ -362,7 +366,10 @@ def _captured_session_id() -> str:
         val = incoming.get(name)
         if val:
             return str(val)
-    return ""
+    # Streamable-HTTP handlers run in the MCP SDK's per-session task, where
+    # HTTP-middleware ContextVars are invisible; MountedServer resolves the
+    # echoed Mcp-Session-Id from the SDK request context as a fallback.
+    return get_current_session_key()
 
 
 def _allowance_key(info: Optional[ClientInfo], backend_name: str, rule_index: int) -> Optional[Tuple[str, str, int]]:
@@ -516,13 +523,13 @@ class TelegramBackend:
 
         text = "\n".join(text_parts)
 
-        # When the request is session-scoped, offer an optional 1-minute bypass
+        # When the request is session-scoped, offer an optional 10-minute bypass
         # button that auto-approves THIS exact rule for that session (no re-notify).
         buttons = [
             {"text": "✅ Approve", "callback_data": f"approve:{request_id}"},
         ]
         if session_id:
-            buttons.append({"text": "⏱ Allow 1 min (session)", "callback_data": f"allow1m:{request_id}"})
+            buttons.append({"text": "⏱ Allow 10 min (session)", "callback_data": f"allow1m:{request_id}"})
         buttons.append({"text": "❌ Reject", "callback_data": f"reject:{request_id}"})
         keyboard = {
             "inline_keyboard": [[button for button in buttons]],
@@ -632,15 +639,15 @@ class TelegramBackend:
                                 updated_text = original_text.rstrip("\n") + "\n\n" + status_text
                             await self._edit_message(chat["id"], msg["message_id"], updated_text, remove_keyboard=True)
                         elif action == "allow1m":
-                            # Operator granted a short-lived session-scoped bypass: auto-approve THIS
+                            # Operator granted a session-scoped bypass: auto-approve THIS
                             # exact confirm rule for the remaining window (no re-notification needed).
                             if pending.client_key and pending.rule_index >= 0:
                                 _temp_allowances[(pending.client_key, pending.backend_name, pending.rule_index)] = time.monotonic() + _TEMP_ALLOW_WINDOW
                             pending.approved = True
-                            await self._answer_callback(cq["id"], "⏱ Approved for 1 minute (this session) — executing now")
+                            await self._answer_callback(cq["id"], "⏱ Approved for 10 minutes (this session) — executing now")
                             original_text = msg.get("text", "")
                             operator_name = from_user.get("first_name", "Operator")
-                            status_text = f"Status: approved for 1 min (session) by {operator_name}\n"
+                            status_text = f"Status: approved for 10 min (session) by {operator_name}\n"
                             if "Status:" in original_text:
                                 updated_text = re.sub(r"Status:.*\n", status_text, original_text)
                             else:
@@ -1357,6 +1364,8 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     sid = pending.session_id
                     # client_key binds (session id | client ip) so a grant stays tight to this
                     # session ON this connection — another chat/assistant is excluded.
+                    log.info("CONFIRM %s.%s session=%s -> Telegram approval requested",
+                             bc.name, tn, sid or "(none)")
 
                     pending.client_key = allowance_key[0] if allowance_key else ""
                     _pending_requests[request_id] = pending

@@ -774,6 +774,47 @@ def test_allowance_key_binds_session_and_ip():
         policy_proxy._incoming_headers.reset(token)
 
 
+def test_captured_session_id_header_wins_over_fallback():
+    """The middleware-captured header takes priority when both are present."""
+    from gateway import mounted_server as _ms
+
+    hdr_tok = policy_proxy._incoming_headers.set({"Mcp-Session-Id": "hdr-session"})
+    key_tok = _ms._current_session_key.set("mounted-session")
+    try:
+        assert policy_proxy._captured_session_id() == "hdr-session"
+    finally:
+        _ms._current_session_key.reset(key_tok)
+        policy_proxy._incoming_headers.reset(hdr_tok)
+
+
+def test_captured_session_id_falls_back_to_mounted_server_key():
+    """Streamable-HTTP handlers run in the MCP SDK's per-session task, where
+    HTTP-middleware ContextVars are invisible.  The MountedServer resolves the
+    echoed Mcp-Session-Id from the SDK request context; ``_captured_session_id``
+    must fall back to it so the confirm gate can offer the 30-minute button."""
+    from gateway import mounted_server as _ms
+
+    hdr_tok = policy_proxy._incoming_headers.set(None)
+    key_tok = _ms._current_session_key.set("sess-abcd")
+    try:
+        assert policy_proxy._captured_session_id() == "sess-abcd"
+    finally:
+        _ms._current_session_key.reset(key_tok)
+        policy_proxy._incoming_headers.reset(hdr_tok)
+
+
+def test_captured_session_id_empty_without_either_source():
+    from gateway import mounted_server as _ms
+
+    hdr_tok = policy_proxy._incoming_headers.set(None)
+    key_tok = _ms._current_session_key.set("")
+    try:
+        assert policy_proxy._captured_session_id() == ""
+    finally:
+        _ms._current_session_key.reset(key_tok)
+        policy_proxy._incoming_headers.reset(hdr_tok)
+
+
 def test_temp_allow_active_arm_and_expire():
     """Armed temp allowances are active until they expire, then dropped."""
 

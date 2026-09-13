@@ -69,6 +69,29 @@ def get_upstream_progress_callback() -> Optional[UpstreamProgressCallback]:
     """Return the progress-relay callback set by ``call_tool``, or ``None``."""
     return _upstream_progress_callback.get()
 
+# ---------------------------------------------------------------------------
+# Session-key contextvar
+# ---------------------------------------------------------------------------
+# The incoming tools/call request carries the ``Mcp-Session-Id`` header the
+# client echoed back from initialize() (or a client-chosen session name for
+# clients like the VS Code extension). The policy confirm gate wants it to
+# render the "⏱ Allow 30 min (session)" button and to key the temporary
+# allowance.  However, handlers run in the MCP SDK's per-session task, and
+# HTTP-middleware ContextVars set in the request dispatch task are NOT visible
+# there (only connection-scoped values like client IP survive).  So the
+# ``call_tool`` handler below resolves the header directly from the SDK's
+# request context and stores it here; ``policy_proxy._captured_session_id()``
+# falls back to this when the middleware ContextVar is empty.
+# ---------------------------------------------------------------------------
+_current_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_session_key", default=""
+)
+
+
+def get_current_session_key() -> str:
+    """Return the ``Mcp-Session-Id`` echoed by the client on this call, or ``""``."""
+    return _current_session_key.get()
+
 
 class MountedServer:
     """
@@ -218,6 +241,21 @@ class MountedServer:
 
                 callback_token = _upstream_progress_callback.set(_relay)
 
+            # --- Session key capture (confirm-gate support) ---
+            # Resolve the client's Mcp-Session-Id from the SDK request context
+            # (reachable in this task) so the policy confirm gate can offer the
+            # "Allow 30 min (session)" button even though HTTP-middleware
+            # ContextVars from the request task never reach session tasks.
+            session_token = None
+            try:
+                session_key = ""
+                if rc is not None and getattr(rc, "request", None) is not None:
+                    session_key = (rc.request.headers.get("Mcp-Session-Id") or "").strip()
+                if session_key:
+                    session_token = _current_session_key.set(session_key)
+            except Exception:
+                session_token = None
+
             try:
                 result = await handler(**arguments)
                 if isinstance(result, types.CallToolResult):
@@ -236,6 +274,8 @@ class MountedServer:
                     isError=True,
                 )
             finally:
+                if session_token is not None:
+                    _current_session_key.reset(session_token)
                 if callback_token is not None:
                     _upstream_progress_callback.reset(callback_token)
 
