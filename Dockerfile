@@ -62,14 +62,6 @@ RUN pip install --no-cache-dir \
     "websockets>=12.0"
 
 # ------------------------------------------------------------------
-# mcp-server-git — official Python MCP server for git operations
-# (modelcontextprotocol/servers, src/git). Replaces the git-mcp-go
-# binary that used to ship in deploy opt-tools; the gateway spawns it
-# as a stdio child per config/policy/real/git.yaml.
-# ------------------------------------------------------------------
-RUN pip install --no-cache-dir "mcp-server-git==2026.8.18"
-
-# ------------------------------------------------------------------
 # Extracted packages (pip from GitHub).
 #   github.com/prog76/mcp_gateway     (this package)
 #   github.com/prog76/mcp_secure-fox  (browser backend, own container)
