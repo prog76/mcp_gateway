@@ -154,14 +154,29 @@ set_incoming_header_capture(_REQUEST_HEADER_CAPTURE)
 def _incoming_headers_effective() -> Dict[str, str]:
     """Return the incoming MCP client headers for this call.
 
-    Prefers the middleware capture (set by ``ClientInfoMiddleware`` on the HTTP
-    request task) and falls back to the per-session-task capture published by
-    ``MountedServer.call_tool`` — the two live in separate tasks, so exactly one
-    of them is populated for any given tool call. Without the fallback,
-    ``${request_header:NAME}`` references resolve to nothing and the template is
-    left verbatim (which is how ipybox silently lost its per-session kernel key).
+    Merges the middleware capture (set by ``ClientInfoMiddleware`` on the HTTP
+    request task) with the per-session-task capture published by
+    ``MountedServer.call_tool``. The two live in separate tasks and BOTH can be
+    populated — and they can describe DIFFERENT requests: the MCP SDK runs
+    ``call_tool`` inside the task created for the session's ``initialize``
+    request, so the middleware capture belongs to *initialize* (where the
+    client does not yet send ``Mcp-Session-Id`` — the server assigns it in the
+    initialize *response*), while the mounted re-capture reads the headers of
+    the *current* tools/call request. Preferring one wholesale with ``or``
+    therefore left ``${request_header:Mcp-Session-Id}`` unresolved whenever the
+    middleware dict happened to be non-empty (which is how ipybox silently lost
+    its per-session kernel key and re-created a kernel on every call).
+
+    Current-request values (mounted capture) win over stale middleware values.
     """
-    return _incoming_headers.get() or get_captured_incoming_headers() or {}
+    merged: Dict[str, str] = {}
+    middleware = _incoming_headers.get()
+    if middleware:
+        merged.update(middleware)
+    mounted = get_captured_incoming_headers()
+    if mounted:
+        merged.update(mounted)
+    return merged
 
 
 def _resolve_host(ip: str) -> str:
