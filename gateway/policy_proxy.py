@@ -200,12 +200,19 @@ class ClientInfoMiddleware(BaseHTTPMiddleware):
 
         # Capture selected incoming request headers for downstream use.
         incoming = {}
+        raw_headers = dict(request.headers)
         if _REQUEST_HEADER_CAPTURE:
-            raw_headers = dict(request.headers)
             for name in _REQUEST_HEADER_CAPTURE:
                 val = raw_headers.get(name) or raw_headers.get(name.lower())
                 if val is not None:
                     incoming[name] = val
+        # Always capture the stable operator session the ipybox kernel forwards
+        # (X-MCP-Operator-Session = its MCP_SESSION_ID). This keys the gateway's
+        # per-session confirm bypass and must survive ipybox kernel idle-reaps,
+        # so it is captured even when absent from MCP_REQUEST_HEADER_CAPTURE.
+        _os = raw_headers.get("x-mcp-operator-session")
+        if _os is not None:
+            incoming["X-MCP-Operator-Session"] = _os
         ih_token = _incoming_headers.set(incoming or None)
         rp_token = _request_path.set(request.url.path)
 
@@ -382,8 +389,21 @@ _temp_allowances: Dict[Tuple[str, str, int], float] = {}
 
 
 def _captured_session_id() -> str:
-    """Return the Mcp-Session-Id captured from the incoming MCP request (or \"\")."""
+    """Return the stable session id used to key the confirm bypass for a call.
+
+    Prefers ``X-MCP-Operator-Session`` when present: the ipybox kernel forwards
+    its ``MCP_SESSION_ID`` env (= the operator's inbound ``Mcp-Session-Id``,
+    resolved by the gateway policy) under this header. That value is stable for
+    the whole operator conversation and - unlike the kernel-process-local
+    mcp2cli session - survives ipybox kernel idle-reaps, so an operator's
+    "Allow 10 min (session)" grant is not discarded every time the kernel is
+    reaped. Falls back to the raw ``Mcp-Session-Id`` header, then to the
+    MountedServer-captured session key.
+    """
     incoming = _incoming_headers_effective()
+    val = incoming.get("X-MCP-Operator-Session") or incoming.get("x-mcp-operator-session")
+    if val:
+        return str(val)
     for name in ("Mcp-Session-Id", "mcp-session-id", "MCP-SESSION-ID"):
         val = incoming.get(name)
         if val:

@@ -145,23 +145,30 @@ def _capture_incoming_headers(request_headers: Any) -> Optional[dict]:
     untouched).  Lookup is case-insensitive because the SDK exposes headers as
     a plain mapping, not a case-insensitive ``Headers`` object.
     """
-    if not _incoming_header_capture or request_headers is None:
+    if request_headers is None:
         return None
     try:
         lower = {str(k).lower(): v for k, v in request_headers.items()}
     except Exception:
         lower = {}
     captured = {}
-    for name in _incoming_header_capture:
-        val = None
-        try:
-            val = request_headers.get(name)
-        except Exception:
+    # Always capture the stable operator session forwarded by ipybox kernels,
+    # even when it is not in the allowlist (it keys the confirm bypass and must
+    # survive ipybox kernel idle-reaps). Case-insensitive via the lower map.
+    _os = lower.get("x-mcp-operator-session")
+    if _os:
+        captured["X-MCP-Operator-Session"] = str(_os)
+    if _incoming_header_capture:
+        for name in _incoming_header_capture:
             val = None
-        if val is None:
-            val = lower.get(name.lower())
-        if val:
-            captured[name] = str(val)
+            try:
+                val = request_headers.get(name)
+            except Exception:
+                val = None
+            if val is None:
+                val = lower.get(name.lower())
+            if val:
+                captured[name] = str(val)
     return captured or None
 
 
