@@ -93,6 +93,78 @@ def get_current_session_key() -> str:
     return _current_session_key.get()
 
 
+# ---------------------------------------------------------------------------
+# Captured incoming headers (policy-injection support)
+# ---------------------------------------------------------------------------
+# Policy ``inject_argument`` rules may reference incoming MCP client headers
+# via ``${request_header:NAME}`` — e.g. the ipybox policy injects
+# ``kernel_env.MCP_SESSION_ID: "${request_header:Mcp-Session-Id}"`` so that
+# every call from one agent session lands in the same sandbox kernel (and thus
+# reuses one gateway session, which is what makes the "Allow 10 min (session)"
+# confirm bypass apply to every call of that session).
+#
+# Those headers are captured by ``policy_proxy.ClientInfoMiddleware``, whose
+# ContextVars are — exactly like the session key above — NOT visible inside the
+# MCP SDK's per-session task where tool handlers run.  ``resolve_injections()``
+# would therefore see nothing and leave the ``${request_header:...}`` template
+# unresolved; ipybox's ``_resolve_session_id()`` rejected such an unresolved
+# value and fell back to the per-request transport session id, which churns a
+# fresh kernel (and a fresh confirm-gate session) on every call.
+#
+# ``call_tool`` below re-captures the allowlisted headers from the SDK request
+# context and publishes them here; ``policy_proxy`` reads this ContextVar as a
+# fallback when its middleware-scoped one is empty.
+#
+# The allowlist is pushed in by ``policy_proxy`` via
+# ``set_incoming_header_capture()`` (single source of truth: the
+# ``MCP_REQUEST_HEADER_CAPTURE`` env var) so a policy template can never
+# reference a header the operator did not ask to capture.
+# ---------------------------------------------------------------------------
+_captured_incoming_headers: contextvars.ContextVar[
+    Optional[dict]
+] = contextvars.ContextVar("captured_incoming_headers", default=None)
+
+_incoming_header_capture: List[str] = []
+
+
+def set_incoming_header_capture(names: Optional[List[str]]) -> None:
+    """Register the allowlist of incoming headers to re-capture per tool call."""
+    global _incoming_header_capture
+    _incoming_header_capture = [str(n) for n in (names or []) if n]
+
+
+def get_captured_incoming_headers() -> Optional[dict]:
+    """Return the incoming MCP client headers captured for this tool call."""
+    return _captured_incoming_headers.get()
+
+
+def _capture_incoming_headers(request_headers: Any) -> Optional[dict]:
+    """Extract the allowlisted headers from an SDK request's header mapping.
+
+    Returns ``None`` when nothing matched (so callers keep the middleware value
+    untouched).  Lookup is case-insensitive because the SDK exposes headers as
+    a plain mapping, not a case-insensitive ``Headers`` object.
+    """
+    if not _incoming_header_capture or request_headers is None:
+        return None
+    try:
+        lower = {str(k).lower(): v for k, v in request_headers.items()}
+    except Exception:
+        lower = {}
+    captured = {}
+    for name in _incoming_header_capture:
+        val = None
+        try:
+            val = request_headers.get(name)
+        except Exception:
+            val = None
+        if val is None:
+            val = lower.get(name.lower())
+        if val:
+            captured[name] = str(val)
+    return captured or None
+
+
 class MountedServer:
     """
     An MCP server that can be mounted at a path in a Starlette app.
@@ -212,6 +284,7 @@ class MountedServer:
                 # No active request context — proceed without relay.
                 progress_token = None
                 client_session = None
+                rc = None
 
             log.info("PROGRESS-RELAY setup: token=%r", progress_token)
             if progress_token is not None and client_session is not None:
@@ -246,15 +319,28 @@ class MountedServer:
             # (reachable in this task) so the policy confirm gate can offer the
             # "Allow 30 min (session)" button even though HTTP-middleware
             # ContextVars from the request task never reach session tasks.
+            #
+            # The same context gap applies to the *other* captured incoming
+            # headers: policy injections referencing ``${request_header:NAME}``
+            # (e.g. ipybox's ``kernel_env.MCP_SESSION_ID``) are resolved in this
+            # task, so re-capture the allowlisted headers here too — otherwise
+            # the template stays unresolved and downstream kernels key off the
+            # per-call transport session instead of the agent's session.
             session_token = None
+            headers_token = None
             try:
                 session_key = ""
                 if rc is not None and getattr(rc, "request", None) is not None:
-                    session_key = (rc.request.headers.get("Mcp-Session-Id") or "").strip()
+                    req_headers = rc.request.headers
+                    session_key = (req_headers.get("Mcp-Session-Id") or "").strip()
+                    captured = _capture_incoming_headers(req_headers)
+                    if captured:
+                        headers_token = _captured_incoming_headers.set(captured)
                 if session_key:
                     session_token = _current_session_key.set(session_key)
             except Exception:
                 session_token = None
+                headers_token = None
 
             try:
                 result = await handler(**arguments)
@@ -276,6 +362,8 @@ class MountedServer:
             finally:
                 if session_token is not None:
                     _current_session_key.reset(session_token)
+                if headers_token is not None:
+                    _captured_incoming_headers.reset(headers_token)
                 if callback_token is not None:
                     _upstream_progress_callback.reset(callback_token)
 

@@ -47,8 +47,10 @@ from mcp.types import CallToolResult, TextContent
 
 from gateway.mounted_server import (
     MountedServer,
+    get_captured_incoming_headers,
     get_current_session_key,
     get_upstream_progress_callback,
+    set_incoming_header_capture,
 )
 import gateway.telegram_mcp as telegram_mcp
 from gateway.policy_yaml import PolicyLoader
@@ -121,7 +123,8 @@ _request_headers: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars
 
 # ContextVar holding per-request incoming HTTP headers captured from the
 # MCP client's request. Compounds can reference these via ${request_header:NAME}
-# to dynamically forward client-supplied headers downstream.
+# to dynamically forward client-supplied headers downstream. Policy inject rules
+# can too (e.g. ipybox's kernel_env.MCP_SESSION_ID).
 _incoming_headers: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar("incoming_headers", default=None)
 # Incoming request path (for skills-compound scoping of the bypass).
 _request_path: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_path", default=None)
@@ -140,6 +143,25 @@ _REQUEST_HEADER_CAPTURE: List[str] = [
     for h in os.environ.get("MCP_REQUEST_HEADER_CAPTURE", "").split(",")
     if h.strip()
 ]
+
+# Share the allowlist with MountedServer: HTTP-middleware ContextVars are not
+# visible inside the MCP SDK's per-session task, so the tool-call handler
+# re-captures these headers from the SDK request context (see
+# mounted_server._capture_incoming_headers).
+set_incoming_header_capture(_REQUEST_HEADER_CAPTURE)
+
+
+def _incoming_headers_effective() -> Dict[str, str]:
+    """Return the incoming MCP client headers for this call.
+
+    Prefers the middleware capture (set by ``ClientInfoMiddleware`` on the HTTP
+    request task) and falls back to the per-session-task capture published by
+    ``MountedServer.call_tool`` — the two live in separate tasks, so exactly one
+    of them is populated for any given tool call. Without the fallback,
+    ``${request_header:NAME}`` references resolve to nothing and the template is
+    left verbatim (which is how ipybox silently lost its per-session kernel key).
+    """
+    return _incoming_headers.get() or get_captured_incoming_headers() or {}
 
 
 def _resolve_host(ip: str) -> str:
@@ -361,7 +383,7 @@ _temp_allowances: Dict[Tuple[str, str, int], float] = {}
 
 def _captured_session_id() -> str:
     """Return the Mcp-Session-Id captured from the incoming MCP request (or \"\")."""
-    incoming = _incoming_headers.get() or {}
+    incoming = _incoming_headers_effective()
     for name in ("Mcp-Session-Id", "mcp-session-id", "MCP-SESSION-ID"):
         val = incoming.get(name)
         if val:
@@ -961,7 +983,7 @@ def _resolve_header_refs(value: Any, headers: Optional[Dict[str, str]] = None) -
         if prefix == "header":
             return headers.get(name, m.group(0))
         if prefix == "request_header":
-            incoming = _incoming_headers.get() or {}
+            incoming = _incoming_headers_effective()
             return incoming.get(name, m.group(0))
         return m.group(0)
 
@@ -977,7 +999,7 @@ def resolve_template(template: str, tool_name: str, arguments: dict) -> str:
             name = fp[7:]
             return headers.get(name, m.group(0))
         if fp.startswith("request_header:"):
-            incoming = _incoming_headers.get() or {}
+            incoming = _incoming_headers_effective()
             name = fp[15:]
             return incoming.get(name, m.group(0))
         val = _get_nested(arguments, fp[5:] if fp.startswith("args.") else fp)
@@ -1389,7 +1411,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
 
                     # Pre-approved skill calls (skills-ipybox) skip the Telegram
                     # confirm flow entirely. Deny rules already ran before this point.
-                    _ih = _incoming_headers.get() or {}
+                    _ih = _incoming_headers_effective()
                     _tok = os.environ.get("SKILLS_BYPASS_TOKEN", "")
                     if (_tok and _ih.get("X-Skill-Bypass") == _tok
                             and (_request_path.get() or "").rstrip("/") == "/mcp/skills"):

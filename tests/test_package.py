@@ -925,6 +925,101 @@ def test_captured_session_id_empty_without_either_source():
         policy_proxy._incoming_headers.reset(hdr_tok)
 
 
+# ---------------------------------------------------------------------------
+# Per-session-task capture of incoming headers (policy inject support)
+# ---------------------------------------------------------------------------
+def test_resolve_injections_uses_session_task_captured_headers():
+    """${request_header:NAME} resolves from the MountedServer capture.
+
+    Regression: the middleware-scoped capture is empty inside the MCP SDK's
+    per-session task, so the ipybox policy's
+    ``kernel_env.MCP_SESSION_ID: ${request_header:Mcp-Session-Id}`` stayed
+    verbatim.  ipybox rejected the unresolved value and keyed its kernel on the
+    per-call transport session instead, starting a fresh kernel (and a fresh
+    confirm-gate session) on every execute_code call — so the "Allow 10 min
+    (session)" bypass never matched.
+    """
+    from gateway import mounted_server as _ms
+
+    hdr_tok = policy_proxy._incoming_headers.set(None)
+    cap_tok = _ms._captured_incoming_headers.set({"Mcp-Session-Id": "sess-xyz"})
+    try:
+        out = policy_proxy.resolve_injections(
+            {"kernel_env": {"MCP_SESSION_ID": "${request_header:Mcp-Session-Id}"}}
+        )
+        assert out["kernel_env"]["MCP_SESSION_ID"] == "sess-xyz"
+        # resolve_template (used by match/template rules) sees it too.
+        assert policy_proxy.resolve_template(
+            "${request_header:Mcp-Session-Id}", "execute_code", {}
+        ) == "sess-xyz"
+    finally:
+        _ms._captured_incoming_headers.reset(cap_tok)
+        policy_proxy._incoming_headers.reset(hdr_tok)
+
+
+def test_resolve_injections_middleware_capture_wins_over_session_task():
+    """The middleware capture keeps priority when both sources are populated."""
+    from gateway import mounted_server as _ms
+
+    hdr_tok = policy_proxy._incoming_headers.set({"Mcp-Session-Id": "middleware"})
+    cap_tok = _ms._captured_incoming_headers.set({"Mcp-Session-Id": "session-task"})
+    try:
+        assert policy_proxy._incoming_headers_effective() == {"Mcp-Session-Id": "middleware"}
+        out = policy_proxy.resolve_injections({"sid": "${request_header:Mcp-Session-Id}"})
+        assert out["sid"] == "middleware"
+    finally:
+        _ms._captured_incoming_headers.reset(cap_tok)
+        policy_proxy._incoming_headers.reset(hdr_tok)
+
+
+def test_resolve_injections_leaves_template_when_no_headers_captured():
+    """With neither source populated the template stays verbatim (pre-fix behavior)."""
+    from gateway import mounted_server as _ms
+
+    hdr_tok = policy_proxy._incoming_headers.set(None)
+    cap_tok = _ms._captured_incoming_headers.set(None)
+    try:
+        out = policy_proxy.resolve_injections({"sid": "${request_header:Mcp-Session-Id}"})
+        assert out["sid"] == "${request_header:Mcp-Session-Id}"
+    finally:
+        _ms._captured_incoming_headers.reset(cap_tok)
+        policy_proxy._incoming_headers.reset(hdr_tok)
+
+
+def test_capture_incoming_headers_respects_allowlist():
+    """Only allowlisted header names are captured (no accidental secret capture)."""
+    from gateway import mounted_server as _ms
+
+    prev = _ms._incoming_header_capture
+    _ms.set_incoming_header_capture(["Mcp-Session-Id"])
+    try:
+        captured = _ms._capture_incoming_headers({
+            "Mcp-Session-Id": "s1",
+            "Authorization": "Bearer secret",
+            "X-Skill-Bypass": "token",
+        })
+        assert captured == {"Mcp-Session-Id": "s1"}
+    finally:
+        _ms.set_incoming_header_capture(prev)
+
+
+def test_capture_incoming_headers_case_insensitive_and_canonical():
+    """A lower-cased inbound header is captured under the canonical policy name."""
+    from gateway import mounted_server as _ms
+
+    prev = _ms._incoming_header_capture
+    _ms.set_incoming_header_capture(["Mcp-Session-Id", "X-Skill-Bypass"])
+    try:
+        assert _ms._capture_incoming_headers({"mcp-session-id": "s2"}) == {
+            "Mcp-Session-Id": "s2"
+        }
+        # Nothing captured → None, so callers leave the middleware value alone.
+        assert _ms._capture_incoming_headers({"Accept": "application/json"}) is None
+        assert _ms._capture_incoming_headers(None) is None
+    finally:
+        _ms.set_incoming_header_capture(prev)
+
+
 def test_temp_allow_active_arm_and_expire():
     """Armed temp allowances are active until they expire, then dropped."""
 
