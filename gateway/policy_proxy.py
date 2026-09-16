@@ -151,6 +151,44 @@ _REQUEST_HEADER_CAPTURE: List[str] = [
 set_incoming_header_capture(_REQUEST_HEADER_CAPTURE)
 
 
+def _headerless_client_session_id(info: Optional[ClientInfo]) -> str:
+    """Synthesize a stable session id for headerless (stateless) clients.
+
+    Stateless/browser compounds (``allow_browser=True`` are mounted with
+    ``stateless=True``) never issue a ``Mcp-Session-Id`` and their clients
+    send none, so ``${request_header:Mcp-Session-Id}`` stayed the literal
+    template: ipybox minted a fresh kernel per call and the confirm bypass had
+    no session to key on (every call re-prompted). The operator identity on
+    that transport is the client connection itself, so key on the client IP —
+    the same signal ``_allowance_key`` already binds the grant to.
+    """
+    if info is None:
+        return ""
+    ip = (info.ip or "").strip()
+    if not ip:
+        return ""
+    safe = "".join(ch if ch.isalnum() else "-" for ch in ip).strip("-") or "unknown"
+    return "clientip-%s" % safe
+
+
+def _apply_headerless_client_session(merged: Dict[str, str]) -> None:
+    """Fill in the synthesized headerless-client session id when none exists.
+
+    Leaves a genuine ``X-MCP-Operator-Session``/``Mcp-Session-Id`` (any casing)
+    untouched; otherwise sets ``Mcp-Session-Id`` so policy injections and the
+    confirm gate see a stable operator session on stateless transports too.
+    """
+    if any(merged.get(k) for k in (
+        "X-MCP-Operator-Session", "x-mcp-operator-session",
+        "Mcp-Session-Id", "mcp-session-id", "MCP-SESSION-ID",
+    )):
+        return
+    sid = _headerless_client_session_id(_client_info.get())
+    if sid:
+        merged.setdefault("Mcp-Session-Id", sid)
+
+
+
 def _incoming_headers_effective() -> Dict[str, str]:
     """Return the incoming MCP client headers for this call.
 
@@ -176,6 +214,7 @@ def _incoming_headers_effective() -> Dict[str, str]:
     mounted = get_captured_incoming_headers()
     if mounted:
         merged.update(mounted)
+    _apply_headerless_client_session(merged)
     return merged
 
 

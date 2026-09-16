@@ -957,32 +957,91 @@ def test_resolve_injections_uses_session_task_captured_headers():
         policy_proxy._incoming_headers.reset(hdr_tok)
 
 
-def test_resolve_injections_middleware_capture_wins_over_session_task():
-    """The middleware capture keeps priority when both sources are populated."""
+def test_resolve_injections_current_request_capture_wins_over_stale_middleware():
+    """The per-session current-request capture wins over stale middleware state.
+
+    The middleware capture belongs to *initialize* (no ``Mcp-Session-Id`` yet),
+    while the mounted re-capture reads the headers of the *current* tools/call —
+    so when both are populated they can disagree and the current request wins.
+    """
     from gateway import mounted_server as _ms
 
-    hdr_tok = policy_proxy._incoming_headers.set({"Mcp-Session-Id": "middleware"})
+    hdr_tok = policy_proxy._incoming_headers.set({"Mcp-Session-Id": "initialize"})
     cap_tok = _ms._captured_incoming_headers.set({"Mcp-Session-Id": "session-task"})
     try:
-        assert policy_proxy._incoming_headers_effective() == {"Mcp-Session-Id": "middleware"}
+        assert policy_proxy._incoming_headers_effective() == {"Mcp-Session-Id": "session-task"}
         out = policy_proxy.resolve_injections({"sid": "${request_header:Mcp-Session-Id}"})
-        assert out["sid"] == "middleware"
+        assert out["sid"] == "session-task"
     finally:
         _ms._captured_incoming_headers.reset(cap_tok)
         policy_proxy._incoming_headers.reset(hdr_tok)
 
 
-def test_resolve_injections_leaves_template_when_no_headers_captured():
-    """With neither source populated the template stays verbatim (pre-fix behavior)."""
+def test_resolve_injections_leaves_template_when_no_headers_and_no_client():
+    """With no headers and no client info the template stays verbatim."""
     from gateway import mounted_server as _ms
 
     hdr_tok = policy_proxy._incoming_headers.set(None)
     cap_tok = _ms._captured_incoming_headers.set(None)
+    key_tok = _ms._current_session_key.set("")
+    ci_tok = policy_proxy._client_info.set(None)
     try:
         out = policy_proxy.resolve_injections({"sid": "${request_header:Mcp-Session-Id}"})
         assert out["sid"] == "${request_header:Mcp-Session-Id}"
     finally:
+        policy_proxy._client_info.reset(ci_tok)
+        _ms._current_session_key.reset(key_tok)
         _ms._captured_incoming_headers.reset(cap_tok)
+        policy_proxy._incoming_headers.reset(hdr_tok)
+
+
+def test_headerless_client_session_synthesized_from_client_ip():
+    """Stateless/browser clients send no session headers: synthesize a stable id.
+
+    Regression: on the /mcp/browser compound (stateless=True) no
+    ``Mcp-Session-Id`` is ever issued or echoed, so
+    ``${request_header:Mcp-Session-Id}`` stayed the literal template — ipybox
+    minted a fresh kernel per call and the confirm gate showed
+    ``Session: ${request_header:Mcp-Session-Id}``. The effective headers must
+    carry a stable per-client id instead.
+    """
+    from gateway import mounted_server as _ms
+
+    hdr_tok = policy_proxy._incoming_headers.set(None)
+    cap_tok = _ms._captured_incoming_headers.set(None)
+    key_tok = _ms._current_session_key.set("")
+    ci_tok = policy_proxy._client_info.set(
+        policy_proxy.ClientInfo(ip="172.18.0.1", host="U2-2010")
+    )
+    try:
+        assert policy_proxy._incoming_headers_effective() == {
+            "Mcp-Session-Id": "clientip-172-18-0-1"
+        }
+        out = policy_proxy.resolve_injections(
+            {"kernel_env": {"MCP_SESSION_ID": "${request_header:Mcp-Session-Id}"}}
+        )
+        assert out["kernel_env"]["MCP_SESSION_ID"] == "clientip-172-18-0-1"
+        assert policy_proxy._captured_session_id() == "clientip-172-18-0-1"
+    finally:
+        policy_proxy._client_info.reset(ci_tok)
+        _ms._current_session_key.reset(key_tok)
+        _ms._captured_incoming_headers.reset(cap_tok)
+        policy_proxy._incoming_headers.reset(hdr_tok)
+
+
+def test_headerless_client_session_never_overrides_real_session():
+    """A genuine session header always wins over the synthesized client id."""
+    hdr_tok = policy_proxy._incoming_headers.set({"Mcp-Session-Id": "real-session"})
+    ci_tok = policy_proxy._client_info.set(
+        policy_proxy.ClientInfo(ip="172.18.0.1", host="U2-2010")
+    )
+    try:
+        assert policy_proxy._incoming_headers_effective() == {
+            "Mcp-Session-Id": "real-session"
+        }
+        assert policy_proxy._captured_session_id() == "real-session"
+    finally:
+        policy_proxy._client_info.reset(ci_tok)
         policy_proxy._incoming_headers.reset(hdr_tok)
 
 
