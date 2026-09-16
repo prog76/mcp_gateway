@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import contextvars
 import logging
+import uuid
 from typing import Any, Optional, List, Callable, Awaitable
 
 import anyio
@@ -445,6 +446,47 @@ class MountedServer:
 
         async def handle_sse_connect(scope: Scope, receive: Receive, send: Send):
             """Handle SSE connection from legacy clients (Cline)."""
+            # Legacy SSE has no ``Mcp-Session-Id`` header — the session lives in
+            # the GET stream's ``?session_id``. Publish a STABLE per-connection id
+            # (the connection lasts as long as the client session) *as if* it were
+            # that header, and capture the allowlisted client headers from the
+            # connect request. Without this, ``${request_header:Mcp-Session-Id}``
+            # stays the literal template on this transport: ipybox then resolved a
+            # fresh uuid per call (a new kernel every call) and every kernel
+            # reported the same degenerate "session", so the confirm bypass key
+            # was useless and the operator saw ``Session: ${request_header:...}``.
+            #
+            # ``call_tool_sse`` runs inside this same task (the SSE read loop feeds
+            # it), so ContextVars set here are visible to the tool handlers and to
+            # the policy injection resolution.
+            _hdrs_token = None
+            _sess_token = None
+            try:
+                _raw = {}
+                try:
+                    _raw = {k.decode("latin-1").lower(): v.decode("latin-1")
+                            for k, v in (scope.get("headers") or [])}
+                except Exception:
+                    _raw = {}
+                _captured = {"Mcp-Session-Id": uuid.uuid4().hex}
+                for _name in _incoming_header_capture:
+                    _val = _raw.get(_name.lower())
+                    if _val is not None:
+                        _captured[_name] = _val
+                _hdrs_token = _captured_incoming_headers.set(_captured)
+                _sess_token = _current_session_key.set(_captured["Mcp-Session-Id"])
+            except Exception:
+                _hdrs_token = None
+                _sess_token = None
+            try:
+                await _run_sse_session(scope, receive, send)
+            finally:
+                if _hdrs_token is not None:
+                    _captured_incoming_headers.reset(_hdrs_token)
+                if _sess_token is not None:
+                    _current_session_key.reset(_sess_token)
+
+        async def _run_sse_session(scope: Scope, receive: Receive, send: Send):
             async with self._sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
                 # Create a server instance with our tool handlers for this session
                 server = MCPServerSDK(self.name)
