@@ -1371,6 +1371,17 @@ async def discover_from_backend(bc) -> Tuple[List, Optional[str]]:
 
     err_msg = _extract_mcp_error_message(last_error) if last_error else "unknown error"
     log.error("Could not discover tools from %s after %d retries: %s", bc.name, MAX_DISCOVERY_RETRIES, err_msg)
+    # An OAuth backend answers 401 to discovery before any tool call exists, so
+    # this is usually the FIRST time we learn a login is needed - and the last
+    # chance to ask for one, because the backend stays unregistered (and thus
+    # uncallable) until discovery succeeds.
+    if getattr(bc, "auth", None) is not None and last_error is not None and _oauth_challenged(last_error):
+        _maybe_offer_oauth_login(bc)
+        return [], (
+            f"Backend '{bc.name}' requires OAuth: a login link was sent to the "
+            f"operator chat (callback port {bc.auth.callback_port}). "
+            "Its tools appear after the grant is stored; restart or re-discover then."
+        )
     return [], f"Backend '{bc.name}' unavailable: {err_msg}"
 
 

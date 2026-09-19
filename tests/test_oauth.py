@@ -530,3 +530,92 @@ def test_login_offer_ignores_plain_backends(tmp_path, monkeypatch):
     bc = policy_proxy.BackendConfig(name="plain", url="https://plain.example/mcp")
     policy_proxy._maybe_offer_oauth_login(bc)  # must not raise
     assert policy_proxy._oauth_link_offered == set()
+
+
+def test_discovery_offers_login_for_oauth_backend(monkeypatch, tmp_path):
+    """Discovery is the FIRST 401 an OAuth backend produces.
+
+    If it does not offer the login link, the backend stays unregistered - its
+    tools never exist, so no tool call can ever reach the challenge handler in
+    forward() and the operator has no way to authenticate at all.
+    """
+    import asyncio
+
+    from gateway import policy_proxy
+
+    monkeypatch.setattr(policy_proxy, "_oauth_tokens", TokenManager(tmp_path / "oauth"))
+    monkeypatch.setattr(policy_proxy, "_oauth_link_offered", set())
+    monkeypatch.setattr(policy_proxy, "_oauth_link_failed", {})
+    monkeypatch.setattr(policy_proxy, "MAX_DISCOVERY_RETRIES", 1)
+    monkeypatch.setattr(policy_proxy, "DISCOVERY_RETRY_DELAY", 0)
+
+    offered = []
+    monkeypatch.setattr(
+        policy_proxy, "_maybe_offer_oauth_login", lambda bc: offered.append(bc.name)
+    )
+
+    class _Resp:
+        status_code = 401
+
+    class _Unreachable(Exception):
+        response = _Resp()
+
+    def _boom(url, headers=None):
+        # streamablehttp_client returns an async context manager, not a coroutine:
+        # the production code does `async with streamablehttp_client(...)`.
+        class _Failing:
+            async def __aenter__(self):
+                raise _Unreachable("401 Unauthorized")
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Failing()
+
+    monkeypatch.setattr(policy_proxy, "streamablehttp_client", _boom)
+
+    bc = policy_proxy.BackendConfig(
+        name="k8s-platform", url="https://x.example/mcp",
+        auth=BackendAuth(client_id="c"),
+    )
+    tools, error = asyncio.run(policy_proxy.discover_from_backend(bc))
+    assert tools == []
+    assert offered == ["k8s-platform"], "discovery must ask for a login"
+    assert "requires OAuth" in error
+
+
+def test_discovery_does_not_offer_for_plain_backend(monkeypatch, tmp_path):
+    """A non-OAuth backend that is simply down must not offer a login."""
+    import asyncio
+
+    from gateway import policy_proxy
+
+    monkeypatch.setattr(policy_proxy, "MAX_DISCOVERY_RETRIES", 1)
+    monkeypatch.setattr(policy_proxy, "DISCOVERY_RETRY_DELAY", 0)
+    offered = []
+    monkeypatch.setattr(
+        policy_proxy, "_maybe_offer_oauth_login", lambda bc: offered.append(bc.name)
+    )
+
+    class _Resp:
+        status_code = 401
+
+    class _Unreachable(Exception):
+        response = _Resp()
+
+    def _boom(url, headers=None):
+        class _Failing:
+            async def __aenter__(self):
+                raise _Unreachable("401 Unauthorized")
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Failing()
+
+    monkeypatch.setattr(policy_proxy, "streamablehttp_client", _boom)
+    bc = policy_proxy.BackendConfig(name="plain", url="https://plain.example/mcp")
+    tools, error = asyncio.run(policy_proxy.discover_from_backend(bc))
+    assert tools == []
+    assert offered == []
+    assert "unavailable" in error
