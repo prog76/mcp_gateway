@@ -397,3 +397,136 @@ def test_listener_port_conflict_is_a_clear_error():
             CallbackListener("127.0.0.1", blocker.port, "/callback")
     finally:
         blocker.close()
+
+
+# -- policy wiring -------------------------------------------------------------
+
+
+def test_backend_config_carries_auth(tmp_path):
+    """The auth block must survive policy loading into BackendConfig."""
+    policy = tmp_path / "k8s-platform.yaml"
+    policy.write_text(
+        """backend:
+  name: k8s-platform
+  url: https://mcp-gw-test.example/servers/abc/mcp
+  auth:
+    client_id: kubernetes-mcp-cursor
+    callback_port: 8899
+rules:
+  - match: { tool: ".*" }
+    action: allow
+""",
+        encoding="utf-8",
+    )
+    from gateway.policy_proxy import load_backend_policy
+
+    config, rules = load_backend_policy(str(policy))
+    assert config.auth is not None
+    assert config.auth.client_id == "kubernetes-mcp-cursor"
+    assert config.auth.redirect_uri() == "http://localhost:8899/callback"
+    assert rules
+
+
+def test_backend_without_auth_block_has_none(tmp_path):
+    policy = tmp_path / "plain.yaml"
+    policy.write_text(
+        """backend:
+  name: plain
+  url: https://plain.example/mcp
+rules:
+  - match: { tool: ".*" }
+    action: allow
+""",
+        encoding="utf-8",
+    )
+    from gateway.policy_proxy import load_backend_policy
+
+    config, _ = load_backend_policy(str(policy))
+    assert config.auth is None
+
+
+def test_attach_backend_auth_is_noop_for_plain_backends():
+    """A backend without auth must pass headers through untouched."""
+    from gateway.policy_proxy import BackendConfig, _attach_backend_auth
+
+    bc = BackendConfig(name="plain", url="https://plain.example/mcp")
+    assert _attach_backend_auth(bc, None) is None
+    original = {"X-Test": "1"}
+    assert _attach_backend_auth(bc, original) == original
+
+
+def test_attach_backend_auth_adds_bearer(idp, tmp_path, monkeypatch):
+    """With a grant stored, the bearer is attached to the request headers."""
+    monkeypatch.setenv("GATEWAY_OAUTH_CACHE_DIR", str(tmp_path / "oauth"))
+    from gateway import policy_proxy
+
+    manager = TokenManager(tmp_path / "oauth")
+    monkeypatch.setattr(policy_proxy, "_oauth_tokens", manager)
+    manager.save(
+        idp.resource,
+        StoredTokens(
+            access_token="tok-1", expires_at=time.time() + 300,
+            resource=idp.resource, client_id="c",
+        ),
+    )
+    bc = policy_proxy.BackendConfig(
+        name="k8s-platform", url=idp.resource,
+        auth=BackendAuth(client_id="c"),
+    )
+    merged = policy_proxy._attach_backend_auth(bc, {"X-Test": "1"})
+    assert merged["Authorization"] == "Bearer tok-1"
+    assert merged["X-Test"] == "1"
+
+
+def test_oauth_challenged_detects_401_through_wrappers():
+    """The MCP SDK wraps transport errors - the status must still be found."""
+    from gateway.policy_proxy import _oauth_challenged
+
+    class _Resp:
+        status_code = 401
+
+    class _Err(Exception):
+        response = _Resp()
+
+    inner = _Err("nope")
+    wrapped = ExceptionGroup("unhandled errors", [inner])  # noqa: F821
+    assert _oauth_challenged(inner) is True
+    assert _oauth_challenged(wrapped) is True
+    assert _oauth_challenged(ValueError("bad request 400")) is False
+    assert _oauth_challenged(ValueError("something else")) is False
+
+
+def test_login_offer_runs_once_per_backend(tmp_path, monkeypatch):
+    """A broken upstream must not spam the operator chat on every call."""
+    from gateway import policy_proxy
+
+    monkeypatch.setattr(policy_proxy, "_oauth_tokens", TokenManager(tmp_path / "oauth"))
+    monkeypatch.setattr(policy_proxy, "_oauth_link_offered", set())
+    monkeypatch.setattr(policy_proxy, "_telegram_backend", None)
+
+    started = []
+
+    class _Recorder:
+        def login_link(self, url, auth):
+            started.append(url)
+            raise OAuthError("no IdP in this test")
+
+    monkeypatch.setattr(policy_proxy, "_oauth_tokens", _Recorder())
+    bc = policy_proxy.BackendConfig(
+        name="k8s-platform", url="https://x.example/mcp", auth=BackendAuth(client_id="c")
+    )
+    policy_proxy._maybe_offer_oauth_login(bc)
+    policy_proxy._maybe_offer_oauth_login(bc)
+    deadline = time.time() + 5
+    while not started and time.time() < deadline:
+        time.sleep(0.05)
+    assert started == ["https://x.example/mcp"], "login must be attempted exactly once"
+
+
+def test_login_offer_ignores_plain_backends(tmp_path, monkeypatch):
+    from gateway import policy_proxy
+
+    monkeypatch.setattr(policy_proxy, "_oauth_link_offered", set())
+    bc = policy_proxy.BackendConfig(name="plain", url="https://plain.example/mcp")
+    policy_proxy._maybe_offer_oauth_login(bc)  # must not raise
+    assert policy_proxy._oauth_link_offered == set()

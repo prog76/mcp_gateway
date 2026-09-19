@@ -54,6 +54,7 @@ from gateway.mounted_server import (
     set_incoming_header_capture,
 )
 import gateway.telegram_mcp as telegram_mcp
+from gateway import oauth as gateway_oauth
 from gateway.policy_yaml import PolicyLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -337,6 +338,8 @@ class BackendConfig:
     pass_kwargs_raw: bool = False
     default_deny: str = "Access denied."
     headers: Optional[Dict[str, str]] = None
+    # OAuth for the upstream (RFC 9728 challenge). None = plain HTTP backend.
+    auth: Optional[gateway_oauth.BackendAuth] = None
 
 
 @dataclass
@@ -931,6 +934,7 @@ def load_backend_policy(path: str) -> Tuple[BackendConfig, List[Dict]]:
         pass_kwargs_raw=br.get("pass_kwargs_raw", False),
         default_deny=raw.get("default_deny", "Access denied."),
         headers=br.get("headers"),
+        auth=gateway_oauth.BackendAuth.from_yaml(br.get("auth")),
     ), rules
 
 
@@ -952,7 +956,8 @@ def load_legacy_policy(path: str) -> List[Tuple[BackendConfig, List[Dict]]]:
     backends = []
     for name, conf in raw.get("backends", {}).items():
         backends.append((BackendConfig(name=name, url=conf.get("url"), command=conf.get("command"),
-            args=conf.get("args", []), path=f"/mcp/{name}"), raw.get("rules", [])))
+            args=conf.get("args", []), path=f"/mcp/{name}",
+            auth=gateway_oauth.BackendAuth.from_yaml(conf.get("auth"))), raw.get("rules", [])))
     return backends
 
 
@@ -1220,6 +1225,110 @@ def _oauth_challenged(exc: BaseException) -> bool:
     return False
 
 
+# Shared, process-wide token manager (grants persist across restarts).
+_oauth_tokens = gateway_oauth.TokenManager()
+# Backends already offered a login link this process, so a broken upstream does
+# not spam the operator chat on every call.
+_oauth_link_offered: set = set()
+# Backends whose login start FAILED, with when. Retried after a cooldown so a
+# transient discovery failure heals without spamming the chat every call.
+_oauth_link_failed: Dict[str, float] = {}
+OAUTH_LINK_RETRY_SECONDS = 300
+# A login that simply was not completed in time is retried sooner: the operator
+# may still be clicking.
+OAUTH_PENDING_RETRY_SECONDS = 30
+
+
+def _attach_backend_auth(bc, headers: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """Return headers plus the stored bearer for an OAuth backend, or as-is.
+
+    A backend with no auth block (or no grant yet) passes through unchanged; the
+    upstream then answers 401 and _maybe_offer_oauth_login reacts.
+    """
+    auth = getattr(bc, "auth", None)
+    if auth is None:
+        return headers
+    token_header = _oauth_tokens.authorization_header(bc.url)
+    if not token_header:
+        return headers
+    merged = dict(headers or {})
+    merged["Authorization"] = token_header
+    return merged
+
+
+def _maybe_offer_oauth_login(bc) -> None:
+    """Offer the operator a login link for an OAuth backend, once per process.
+
+    The link goes to Telegram when the notification backend is configured, and
+    always to the gateway log. The code exchange runs in a daemon thread, so the
+    tool call that met the 401 returns immediately either way.
+    """
+    auth = getattr(bc, "auth", None)
+    if auth is None or bc.url in _oauth_link_offered:
+        return
+    failed_at = _oauth_link_failed.get(bc.url)
+    if failed_at is not None and (time.time() - failed_at) < OAUTH_LINK_RETRY_SECONDS:
+        return
+    _oauth_link_offered.add(bc.url)
+
+    def _await_login() -> None:
+        try:
+            tokens = _oauth_tokens.complete_login(
+                bc.url, timeout_seconds=auth.login_timeout_seconds + 30
+            )
+        except gateway_oauth.LoginPending:
+            log.warning("oauth: login for %s not completed in time; the link "
+                        "stays valid in the chat", bc.name)
+            _oauth_link_offered.discard(bc.url)
+            _oauth_link_failed[bc.url] = time.time() - OAUTH_LINK_RETRY_SECONDS + (
+                OAUTH_PENDING_RETRY_SECONDS
+            )
+            return
+        except gateway_oauth.OAuthError as exc:
+            log.error("oauth: login for %s failed: %s", bc.name, exc)
+            _oauth_link_offered.discard(bc.url)
+            _oauth_link_failed[bc.url] = time.time()
+            return
+        log.info("oauth: grant stored for %s (issuer %s)", bc.name, tokens.issuer)
+        # Discovery failed on the 401 that got us here; retry now.
+        try:
+            asyncio.run(discover_from_backend(bc))
+        except Exception as exc:  # noqa: BLE001 - best-effort warm-up
+            log.info("oauth: post-login discovery for %s: %s", bc.name, exc)
+
+    def _offer() -> None:
+        try:
+            link = _oauth_tokens.login_link(bc.url, auth)
+        except gateway_oauth.OAuthError as exc:
+            log.error("oauth: cannot start a login for %s: %s", bc.name, exc)
+            _oauth_link_offered.discard(bc.url)
+            _oauth_link_failed[bc.url] = time.time()
+            return
+        message = (
+            f"\U0001f510 Backend {bc.name} needs OAuth\n"
+            f"{bc.url}\n\n"
+            f"Open and approve (callback on the gateway port "
+            f"{auth.callback_port}):\n{link}"
+        )
+        log.warning("oauth: login link for backend %s: %s", bc.name, link)
+        backend = globals().get("_telegram_backend")
+        if backend is not None:
+            async def _send() -> None:
+                result = await backend.send_message(message)
+                if not result.get("ok"):
+                    log.error("oauth: could not deliver the login link via Telegram")
+
+            try:
+                asyncio.get_running_loop().create_task(_send())
+            except RuntimeError:
+                asyncio.run(_send())
+        threading.Thread(
+            target=_await_login, daemon=True, name=f"oauth-login-{bc.name}"
+        ).start()
+
+    threading.Thread(target=_offer, daemon=True, name=f"oauth-offer-{bc.name}").start()
+
+
 async def discover_from_backend(bc) -> Tuple[List, Optional[str]]:
     """Discover tools from a backend. Returns (tools, error_string)."""
     last_error = None
@@ -1233,6 +1342,7 @@ async def discover_from_backend(bc) -> Tuple[List, Optional[str]]:
                         k: resolve_env_value(v) if isinstance(v, str) else v
                         for k, v in headers.items()
                     }
+                headers = _attach_backend_auth(bc, headers)
                 async with streamablehttp_client(bc.url, headers=headers) as (r, w, _):
                     async with ClientSession(r, w) as s:
                         await s.initialize()
@@ -1283,6 +1393,7 @@ async def forward(bc, tool_name, arguments, progress_callback=None):
                     k: resolve_env_value(v) if isinstance(v, str) else v
                     for k, v in headers.items()
                 }
+            headers = _attach_backend_auth(bc, headers)
             async with streamablehttp_client(bc.url, headers=headers) as (r, w, _):
                 async with ClientSession(r, w) as s:
                     await s.initialize()
