@@ -90,17 +90,17 @@ def _validate_backend_policy(raw: dict, path: str) -> bool:
             # confirm_pending, confirm_denied, confirm_timeout, confirm_approved are optional
             # but we should warn if none are provided
             has_templates = any(
-                rule.get(k) for k in ("confirm_pending", "confirm_denied", "confirm_timeout", "confirm_approved")
+                rule.get(k) for k in ("notify_template", "confirm_pending", "confirm_denied", "confirm_timeout", "confirm_approved")
             )
             if not has_templates:
                 print(f"WARNING: Rule {i}: confirm action has no template fields (confirm_pending, confirm_denied, confirm_timeout, confirm_approved) — defaults will be used")
             # Validate template regex patterns
-            for tpl_field in ("confirm_pending", "confirm_denied", "confirm_timeout", "confirm_approved"):
+            for tpl_field in ("notify_template", "confirm_pending", "confirm_denied", "confirm_timeout", "confirm_approved"):
                 tpl = rule.get(tpl_field)
                 if tpl and "${" in tpl:
                     # Check that template variables are well-formed
                     for var in re.findall(r'\$\{(.+?)\}', tpl):
-                        if var not in ("tool", "reason", "result") and not var.startswith("args.") and not var.startswith("header:") and not var.startswith("request_header:") and var not in ("clientHost", "clientIp") and not var.startswith("env:"):
+                        if var not in ("tool", "backend", "reason", "result") and not var.startswith("args.") and not var.startswith("header:") and not var.startswith("request_header:") and var not in ("clientHost", "clientIp") and not var.startswith("env:"):
                             print(f"WARNING: Rule {i}: unknown template variable '${{{var}}}' in {tpl_field}")
         elif action not in ("allow", "deny", "inject_argument", "confirm"):
             print(f"WARNING: Rule {i}: unknown action '{action}' — treated as allow")

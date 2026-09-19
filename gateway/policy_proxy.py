@@ -413,6 +413,7 @@ class NotificationConfig:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_poll_interval: float = 3.0
+    telegram_template: str = ""
 
 
 @dataclass
@@ -546,6 +547,7 @@ def load_notification_config(path: str) -> Optional[NotificationConfig]:
         cfg.telegram_bot_token = resolve_env_value(tg.get("bot_token", ""))
         cfg.telegram_chat_id = resolve_env_value(tg.get("chat_id", ""))
         cfg.telegram_poll_interval = float(tg.get("poll_interval", 3.0))
+        cfg.telegram_template = str(tg.get("template", "") or "")
 
     log.info("Loaded notification config: telegram=%s, timeout=%ds",
              cfg.telegram_enabled, cfg.timeout)
@@ -589,8 +591,14 @@ class TelegramBackend:
     async def send_approval_request(self, request_id: str, tool_name: str,
                                     arguments: dict, client_info: Optional[ClientInfo],
                                     reason: str, backend_name: str = "",
-                                    session_id: str = "") -> bool:
-        """Send a message with Approve/Reject buttons. Returns True if sent OK."""
+                                    session_id: str = "",
+                                    notify_text: str = "") -> bool:
+        """Send a message with Approve/Reject buttons. Returns True if sent OK.
+
+        If notify_text is given (a per-rule notify_template or the global
+        telegram.template, already resolved by the caller), it is used
+        verbatim as the message body; otherwise the default summary is built.
+        """
         # Build a readable plain-text summary. No parse_mode is used, so no
         # escaping is needed — any character is safe. Long values (e.g. a
         # Confluence page body) are truncated so the message stays within
@@ -621,7 +629,13 @@ class TelegramBackend:
         if session_id:
             text_parts.append(f"Session: {session_id}")
 
-        text = "\n".join(text_parts)
+        if notify_text:
+            # Verbatim template body - the author controls the content.
+            text = notify_text
+            if len(text) > 4000:
+                text = text[:4000] + "... (truncated)"
+        else:
+            text = "\n".join(text_parts)
 
         # When the request is session-scoped, offer an optional 10-minute bypass
         # button that auto-approves THIS exact rule for that session (no re-notify).
@@ -1698,6 +1712,23 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     approved_template = rule.get("confirm_approved",
                                                   "✅ Operator approved. Result:\n\n${result}")
 
+                    # Resolve the Telegram notification body: per-rule
+                    # notify_template wins, then the global telegram.template
+                    # from notifications.yaml; empty = default args summary.
+                    # Vars: ${tool}, ${backend}, ${reason}, ${args.*},
+                    # ${clientHost}, ${clientIp}. Verbatim - the template IS
+                    # the message body (no auto-appended fields).
+                    notify_raw = rule.get("notify_template", "") or (
+                        _notification_config.telegram_template
+                        if _notification_config else ""
+                    ) or ""
+                    notify_text = (
+                        resolve_template(
+                            notify_raw, tn,
+                            {**policy_kw, "reason": reason, "backend": bc.name},
+                        ) if notify_raw else ""
+                    )
+
                     # Get timeout from rule or global config
                     timeout = rule.get("timeout")
                     if timeout is None and _notification_config is not None:
@@ -1714,6 +1745,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         reason=reason,
                         backend_name=bc.name,
                         session_id=sid,
+                        notify_text=notify_text,
                     )
                     if not sent:
                         _pending_requests.pop(request_id, None)

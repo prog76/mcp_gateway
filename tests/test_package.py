@@ -1331,3 +1331,119 @@ def test_exceptiongroup_debug_hint_documented():
     # The actual validation is that the other two tests above catch the
     # problem before it reaches production.
    
+
+
+# ---------------------------------------------------------------------------
+# Per-rule notify_template for Telegram approval messages
+# ---------------------------------------------------------------------------
+
+def _run_confirm_capture(notify_rule=None, global_template="", tool="demo_push", args=None):
+    captured = {}
+    bc = policy_proxy.BackendConfig(name="demo", url="http://demo/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="demo", healthy=True)
+    rule = {"match": {"tool": ".*"}, "action": "confirm", "timeout": 30}
+    if notify_rule is not None:
+        rule["notify_template"] = notify_rule
+    rules = [rule]
+
+    class CapBackend:
+        async def send_approval_request(self, **kw):
+            captured.update(kw)
+            return True
+
+        async def edit_request_timeout(self, request_id):
+            pass
+
+    orig_tg = policy_proxy._telegram_backend
+    orig_forward = policy_proxy.forward
+    orig_cfg = policy_proxy._notification_config
+
+    async def fake_forward(bc, tool_name, arguments):
+        return {"content": ["ok"], "structuredContent": None, "isError": False}
+
+    async def scenario():
+        policy_proxy._telegram_backend = CapBackend()
+        policy_proxy.forward = fake_forward
+        policy_proxy._notification_config = policy_proxy.NotificationConfig(
+            timeout=30, telegram_template=global_template)
+        handler = policy_proxy.make_policy_handler(bc, rules, tool, status)
+        task = asyncio.create_task(handler(**(args or {})))
+        for _ in range(500):
+            if policy_proxy._pending_requests:
+                break
+            await asyncio.sleep(0.01)
+        assert policy_proxy._pending_requests, "confirm never created a pending request"
+        _rid, pending = next(iter(policy_proxy._pending_requests.items()))
+        pending.approved = True
+        pending.event.set()
+        return await task
+
+    try:
+        out = asyncio.run(scenario())
+    finally:
+        policy_proxy._telegram_backend = orig_tg
+        policy_proxy.forward = orig_forward
+        policy_proxy._notification_config = orig_cfg
+        policy_proxy._pending_requests.clear()
+    return captured, out
+
+
+def test_notify_template_per_rule_wins():
+    cap, _ = _run_confirm_capture(
+        notify_rule="push ${args.remote} ${args.branch} (${backend}/${tool})",
+        global_template="GLOBAL ${tool}",
+        args={"remote": "origin", "branch": "feature/x"},
+    )
+    assert cap["notify_text"] == "push origin feature/x (demo/demo_push)"
+
+
+def test_notify_template_global_fallback():
+    cap, _ = _run_confirm_capture(
+        global_template="GLOBAL ${tool} :: ${reason}",
+        args={},
+    )
+    assert cap["notify_text"] == "GLOBAL demo_push :: Operator declined"
+
+
+def test_notify_default_empty_when_no_template():
+    cap, _ = _run_confirm_capture(args={"remote": "origin"})
+    assert cap["notify_text"] == ""
+
+
+def test_notify_verbatim_body_sent():
+    sent = {}
+    be = policy_proxy.TelegramBackend("tok", "123")
+
+    class StubResp:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 1, "chat": {"id": 123}}}
+
+    class StubClient:
+        async def post(self, url, json=None):
+            sent.update(json or {})
+            return StubResp()
+
+    async def scenario():
+        await be._client.aclose()
+        be._client = StubClient()
+        return await be.send_approval_request(
+            "r1", "demo_push", {"a": "b"}, None, "why",
+            backend_name="demo", session_id="", notify_text="CUSTOM BODY")
+
+    ok = asyncio.run(scenario())
+    assert ok is True
+    assert sent["text"] == "CUSTOM BODY"
+
+
+def test_validate_accepts_notify_template(tmp_path):
+    p = tmp_path / "demo.yaml"
+    p.write_text(
+        'backend:\n  name: demo\nrules:\n'
+        '  - match:\n      tool: ".*"\n    action: confirm\n'
+        '    notify_template: "push ${args.branch} (${backend}/${tool})"\n'
+        '  - match:\n      tool: ".*"\n    action: deny\n    reason: "no"\n'
+    )
+    assert validate_policy.validate_policy(str(p)) is True
