@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -1197,6 +1198,28 @@ def _build_stdio_params(bc) -> StdioServerParameters:
     return StdioServerParameters(command=cmd, args=args, env=env, cwd=cwd)
 
 
+def _oauth_challenged(exc: BaseException) -> bool:
+    """True when an exception chain carries an HTTP 401/403 from the backend.
+
+    The MCP SDK wraps transport errors (ExceptionGroup/TaskGroup); the status
+    is what matters, not the wrapper.
+    """
+    seen = 0
+    current: BaseException | None = exc
+    while current is not None and seen < 10:
+        response = getattr(current, "response", None)
+        status = getattr(response, "status_code", None)
+        if status in (401, 403):
+            return True
+        if "401" in str(current) or "403" in str(current) or "Unauthorized" in str(current):
+            return True
+        current = getattr(current, "__cause__", None) or getattr(current, "exceptions", None) and (
+            current.exceptions[0] if getattr(current, "exceptions", None) else None
+        )
+        seen += 1
+    return False
+
+
 async def discover_from_backend(bc) -> Tuple[List, Optional[str]]:
     """Discover tools from a backend. Returns (tools, error_string)."""
     last_error = None
@@ -1281,6 +1304,13 @@ async def forward(bc, tool_name, arguments, progress_callback=None):
                             "isError": res.isError}
         return {"error": f"Backend '{bc.name}': no valid transport"}
     except Exception as e:
+        if getattr(bc, "auth", None) is not None and _oauth_challenged(e):
+            _maybe_offer_oauth_login(bc)
+            return {"content": [
+                f"Backend {bc.name} requires OAuth. A login link was sent to "
+                f"the operator chat (callback port {bc.auth.callback_port}); "
+                "retry after approving."
+            ], "isError": True}
         msg = _extract_mcp_error_message(e)
         log.error("Backend %s error: %s", bc.name, msg, exc_info=True)
         # Prefer the concrete tool/backend message over ExceptionGroup/TaskGroup wrappers
