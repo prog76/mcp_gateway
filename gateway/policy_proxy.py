@@ -707,6 +707,51 @@ class TelegramBackend:
             log.error("Telegram sendMessage error: %s", e)
             return {"ok": False}
 
+    async def send_photo(self, caption="", photo_bytes=None, photo_url=None,
+                         reply_markup=None):
+        """Post a sendPhoto to the operator chat.
+
+        Returns the same shape as send_message: {"ok", "message_id",
+        "chat_id"} - so telegram_mcp handlers treat it like any other send.
+        Inline bytes go up as multipart/form-data; a URL is a plain JSON
+        field that Telegram fetches itself.
+        """
+        if not photo_bytes and not photo_url:
+            return {"ok": False}
+        try:
+            if photo_bytes:
+                form = {"chat_id": str(self.chat_id)}
+                if caption:
+                    form["caption"] = caption
+                if reply_markup:
+                    form["reply_markup"] = reply_markup
+                r = await self._client.post(
+                    f"{self._api_base}/sendPhoto", data=form,
+                    files={"photo": ("photo.png", photo_bytes, "image/png")})
+            else:
+                payload = {"chat_id": self.chat_id, "photo": str(photo_url)}
+                if caption:
+                    payload["caption"] = caption
+                if reply_markup:
+                    payload["reply_markup"] = reply_markup
+                r = await self._client.post(f"{self._api_base}/sendPhoto",
+                                            json=payload)
+            if r.status_code != 200:
+                log.error("Telegram sendPhoto failed: %s %s", r.status_code, r.text)
+                return {"ok": False}
+            result = r.json()
+            if not result.get("ok"):
+                log.error("Telegram sendPhoto API error: %s",
+                          result.get("description", r.text))
+                return {"ok": False}
+            msg = result.get("result", {})
+            return {"ok": True,
+                    "message_id": msg.get("message_id"),
+                    "chat_id": (msg.get("chat") or {}).get("id")}
+        except Exception as e:
+            log.error("Telegram sendPhoto error: %s", e)
+            return {"ok": False}
+
     async def _tg_send(self, text, parse_mode=None, reply_markup=None):
         """Thin wrapper so telegram_mcp tools can send via this backend."""
         return await self.send_message(text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -1003,11 +1048,19 @@ def load_compounds(compounds_path: str, available_backends: Dict[str, BackendCon
     for name, conf in raw.get("compounds", {}).items():
         backend_names = conf.get("backends", [])
 
-        # Validate that all referenced backends exist
-        invalid_backends = [b for b in backend_names if b not in available_backends]
-        if invalid_backends:
-            log.warning("Compound '%s' references unknown backends: %s (skipping)",
-                       name, invalid_backends)
+        # Drop unknown backends instead of killing the whole compound. A
+        # compound is a capability bundle: one absent member must not take the
+        # others down with it. Hard-skipping is why adding an optional backend
+        # to a compound would silently remove k8s+exec+browser from every
+        # py-skill whenever that backend was not registered.
+        known_backends = [b for b in backend_names if b in available_backends]
+        unknown_backends = [b for b in backend_names if b not in available_backends]
+        if unknown_backends:
+            log.warning("Compound '%s': dropping unknown backends %s (keeping %s)",
+                       name, unknown_backends, known_backends)
+        backend_names = known_backends
+        if not backend_names:
+            log.warning("Compound '%s' has no known backends (skipping)", name)
             continue
 
         path = conf.get("path", f"/mcp/{name}")
@@ -2214,7 +2267,12 @@ async def create_compound_server(compound: CompoundConfig,
                             kw = {**kw, **injections}
 
                                                 # Forward to backend
-                        result = await forward(backend_cfg, original_name, kw)
+                        if getattr(backend_st, "synthetic", False):
+                            # In-process backend: no transport and nothing to
+                            # discover, so dispatch through its own handler table.
+                            result = await telegram_mcp.forward(original_name, kw)
+                        else:
+                            result = await forward(backend_cfg, original_name, kw)
                         if "error" in result:
                             log.error("Tool call %s.%s FAILED: %s (args=%s)",
                                       backend_cfg.name, original_name, result["error"], _sanitize_args(policy_kw))
@@ -2342,13 +2400,29 @@ async def main():
 
         # Load and create compound endpoints
         compounds_path = os.environ.get("COMPOUNDS_CONFIG", "/etc/mcp-gateways/compounds.yaml")
-        compounds = load_compounds(compounds_path, backend_config_map)
+
+        # The telegram tools server is in-process: no transport, nothing to
+        # discover and no policy file, so it is absent from backend_config_map.
+        # Register it so load_compounds accepts a compound that lists it and
+        # the compound tool loop below can find it.
+        compound_backend_map = dict(backend_config_map)
+        if _telegram_backend is not None:
+            compound_backend_map["telegram"] = BackendConfig(name="telegram")
+        compounds = load_compounds(compounds_path, compound_backend_map)
 
         compound_statuses: List[CompoundStatus] = []
         compound_servers = []
 
         # Build backend status map for compound creation
         backend_status_map = {s.name: s for s in backend_statuses}
+
+        # Synthetic BackendStatus for the telegram tools. Must land in the map
+        # BEFORE the compound loop reads it: create_compound_server dispatches a
+        # synthetic backend through telegram_mcp.forward().
+        if _telegram_backend is not None:
+            backend_status_map["telegram"] = telegram_mcp.attach_synthetic_backend(
+                BackendStatus, BackendConfig, name="telegram")
+            log.info("Telegram tools registered as a synthetic compound backend")
 
         for compound in compounds:
             try:
