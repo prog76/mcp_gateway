@@ -1447,3 +1447,191 @@ def test_validate_accepts_notify_template(tmp_path):
         '  - match:\n      tool: ".*"\n    action: deny\n    reason: "no"\n'
     )
     assert validate_policy.validate_policy(str(p)) is True
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# confirm-hard (bypass-proof) — kanban t_ccc3cf8a.
+# The X-Skill-Bypass token and the operator session allowance must NOT
+# short-circuit a confirm-hard rule; a timed-out confirm-hard wait returns
+# the typed awaiting_approval outcome instead of an error or a hang.
+# ---------------------------------------------------------------------------
+
+
+def test_skill_bypass_skips_confirm_but_not_confirm_hard(monkeypatch):
+    """With a valid X-Skill-Bypass token on /mcp/skills a `confirm` rule
+    awaiting_approval result without running the call."""
+    token = "sekrit-bypass-token"
+    monkeypatch.setenv("SKILLS_BYPASS_TOKEN", token)
+    bc = policy_proxy.BackendConfig(name="skills-ipybox", url="http://skills/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="skills-ipybox", healthy=True)
+    forwarded = []
+
+    async def fake_forward(bc, tool_name, arguments):
+        forwarded.append(tool_name)
+        return {"content": ["written"], "structuredContent": {"ok": True}, "isError": False}
+
+    class FakeTG:
+        async def send_approval_request(self, **kw):
+            return True
+
+        async def edit_request_timeout(self, request_id):
+            return None
+
+    orig_forward = policy_proxy.forward
+    orig_tg = policy_proxy._telegram_backend
+    t_cli = t_path = t_hdr = None
+    try:
+        policy_proxy.forward = fake_forward
+        policy_proxy._telegram_backend = FakeTG()
+        t_cli = policy_proxy._client_info.set(policy_proxy.ClientInfo(ip="10.0.0.1", host="h"))
+        t_path = policy_proxy._request_path.set("/mcp/skills")
+        t_hdr = policy_proxy._incoming_headers.set({"X-Skill-Bypass": token})
+
+        # (1) plain confirm + bypass token -> allowed, no human asked
+        h = policy_proxy.make_policy_handler(
+            bc, [{"match": {"tool": ".*"}, "action": "confirm"}], "run_skill", status)
+        asyncio.run(h(name="probe"))
+        assert forwarded == ["run_skill"]
+        assert policy_proxy._pending_requests == {}
+
+        # (2) confirm-hard + the SAME token -> waits, then typed non-error
+        h = policy_proxy.make_policy_handler(
+            bc, [{"match": {"tool": ".*"}, "action": "confirm-hard", "timeout": 1}],
+            "write_playbook_script", status)
+        out = asyncio.run(h(name="p", filename="a.py", content="c"))
+        assert forwarded == ["run_skill"]  # the write did NOT run
+        sc = out.structuredContent
+        assert sc is not None and sc.get("status") == "awaiting_approval"
+        assert sc.get("resolved") is False and sc.get("tool") == "write_playbook_script"
+        assert out.isError is False
+        assert policy_proxy._pending_requests == {}
+    finally:
+        policy_proxy.forward = orig_forward
+        policy_proxy._telegram_backend = orig_tg
+        if t_cli is not None:
+            policy_proxy._client_info.reset(t_cli)
+        if t_path is not None:
+            policy_proxy._request_path.reset(t_path)
+        if t_hdr is not None:
+            policy_proxy._incoming_headers.reset(t_hdr)
+        policy_proxy._pending_requests.clear()
+
+
+def test_confirm_hard_ignores_session_allowance(monkeypatch):
+    """An armed operator session allowance auto-approves a plain `confirm`
+    rule but never a `confirm-hard` one."""
+    monkeypatch.delenv("SKILLS_BYPASS_TOKEN", raising=False)
+    bc = policy_proxy.BackendConfig(name="skills-ipybox", url="http://skills/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="skills-ipybox", healthy=True)
+    forwarded = []
+
+    async def fake_forward(bc, tool_name, arguments):
+        forwarded.append(tool_name)
+        return {"content": ["ok"], "structuredContent": None, "isError": False}
+
+    class FakeTG:
+        async def send_approval_request(self, **kw):
+            return True
+
+        async def edit_request_timeout(self, request_id):
+            return None
+
+    orig_forward = policy_proxy.forward
+    orig_tg = policy_proxy._telegram_backend
+    orig_allow = dict(policy_proxy._temp_allowances)
+    t_cli = t_hdr = None
+    try:
+        policy_proxy.forward = fake_forward
+        policy_proxy._telegram_backend = FakeTG()
+        info = policy_proxy.ClientInfo(ip="10.0.0.1", host="h")
+        t_cli = policy_proxy._client_info.set(info)
+        t_hdr = policy_proxy._incoming_headers.set({"Mcp-Session-Id": "sess-1"})
+        key = policy_proxy._allowance_key(info, "skills-ipybox", 0)
+        policy_proxy._temp_allowances[key] = time.monotonic() + 60
+
+        # plain confirm: the allowance short-circuits it
+        h = policy_proxy.make_policy_handler(
+            bc, [{"match": {"tool": ".*"}, "action": "confirm"}], "run_skill", status)
+        asyncio.run(h(name="probe"))
+        assert forwarded == ["run_skill"]
+
+        # confirm-hard: the same allowance is refused -> waits, typed outcome
+        h = policy_proxy.make_policy_handler(
+            bc, [{"match": {"tool": ".*"}, "action": "confirm-hard", "timeout": 1}],
+            "write_skill_md", status)
+        out = asyncio.run(h(name="p", content="c"))
+        assert forwarded == ["run_skill"]  # not forwarded
+        sc = out.structuredContent
+        assert sc is not None and sc.get("status") == "awaiting_approval"
+        assert out.isError is False
+    finally:
+        policy_proxy.forward = orig_forward
+        policy_proxy._telegram_backend = orig_tg
+        if t_cli is not None:
+            policy_proxy._client_info.reset(t_cli)
+        if t_hdr is not None:
+            policy_proxy._incoming_headers.reset(t_hdr)
+        policy_proxy._temp_allowances.clear()
+        policy_proxy._temp_allowances.update(orig_allow)
+        policy_proxy._pending_requests.clear()
+
+
+def test_confirm_hard_hides_allow10_button():
+    """The Telegram keyboard for a confirm-hard ask offers Approve/Reject
+    only - no Allow-10-min button (that grant would be dead weight)."""
+    import json as _json
+    sent = {}
+
+    class StubResp:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 1, "chat": {"id": 123}}}
+
+    class StubClient:
+        async def post(self, url, json=None):
+            sent.update(json or {})
+            return StubResp()
+
+    async def scenario():
+        be = policy_proxy.TelegramBackend("tok", "123")
+        await be._client.aclose()
+        be._client = StubClient()
+        ok = await be.send_approval_request(
+            "r1", "write_playbook_script", {"a": "b"}, None, "why",
+            backend_name="skills-ipybox", session_id="sess-1", notify_text="",
+            allow_session_grant=False)
+        hard_kb = _json.loads(sent["reply_markup"])
+        ok2 = await be.send_approval_request(
+            "r2", "write_playbook_script", {"a": "b"}, None, "why",
+            backend_name="skills-ipybox", session_id="sess-1", notify_text="")
+        normal_kb = _json.loads(sent["reply_markup"])
+        return ok, hard_kb, ok2, normal_kb
+
+    ok, hard_kb, ok2, normal_kb = asyncio.run(scenario())
+    hard_data = [b["callback_data"] for b in hard_kb["inline_keyboard"][0]]
+    normal_data = [b["callback_data"] for b in normal_kb["inline_keyboard"][0]]
+    assert ok is True and ok2 is True
+    assert any(d.startswith("approve:") for d in hard_data)
+    assert any(d.startswith("reject:") for d in hard_data)
+    assert not any(d.startswith("allow1m:") for d in hard_data)
+    assert any(d.startswith("allow1m:") for d in normal_data)
+
+
+def test_validate_policy_accepts_confirm_hard(tmp_path):
+    """validate_policy must recognise confirm-hard as a known action - an
+    unknown action would warn treated-as-allow."""
+    p = tmp_path / "hard.yaml"
+    rows = [
+        "backend:",
+        "  name: demo",
+        "  url: http://demo/mcp",
+        "rules:",
+        "  - match:",
+        "      tool: .*",
+        "    action: confirm-hard",
+        "",
+    ]
+    p.write_text(chr(10).join(rows))
+    assert validate_policy.validate_policy(str(p)) is True

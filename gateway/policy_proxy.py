@@ -444,6 +444,26 @@ _pending_requests: Dict[str, PendingRequest] = {}
 # Keyed by: ((session-scoped client_key, backend_name, rule_index) -> monotonic expiry.
 
 _TEMP_ALLOW_WINDOW = float(os.environ.get("MCP_TEMP_ALLOW_SECONDS", "600"))
+
+# ---------------------------------------------------------------------------
+# Policy actions that gate on a human decision in Telegram
+# ---------------------------------------------------------------------------
+# confirm       - the ask MAY be short-circuited by an automatic grant: the
+#                 shared X-Skill-Bypass token on /mcp/skills, or the operator's
+#                 long-lived Allow-10-min (session) allowance for this rule.
+# confirm-hard  - BYPASS-PROOF: no automatic short-circuit is honoured, so a
+#                 fresh human decision is required for every call. Used for
+#                 actions a pre-approved skill must never auto-approve on its
+#                 own behalf (write_playbook_script / write_skill_md = a skill
+#                 rewriting itself).
+CONFIRM_ACTIONS = ("confirm", "confirm-hard")
+
+# Hard ceiling (seconds) on a confirm-hard Telegram wait. The CALLER's
+# tool-call wall is MCP_TOOL_TIMEOUT_SECONDS=120 and skills-ipybox dials the
+# gateway with a 120s httpx timeout, so a confirm-hard wait MUST resolve below
+# that or the caller dies in a transport timeout instead of the typed
+# awaiting_approval outcome. A per-rule timeout: may lower this, never raise.
+CONFIRM_HARD_MAX_WAIT_SECONDS = float(os.environ.get("MCP_CONFIRM_HARD_TIMEOUT_SECONDS", "90"))
 _temp_allowances: Dict[Tuple[str, str, int], float] = {}
 
 
@@ -592,7 +612,8 @@ class TelegramBackend:
                                     arguments: dict, client_info: Optional[ClientInfo],
                                     reason: str, backend_name: str = "",
                                     session_id: str = "",
-                                    notify_text: str = "") -> bool:
+                                    notify_text: str = "",
+                                    allow_session_grant: bool = True) -> bool:
         """Send a message with Approve/Reject buttons. Returns True if sent OK.
 
         If notify_text is given (a per-rule notify_template or the global
@@ -642,7 +663,9 @@ class TelegramBackend:
         buttons = [
             {"text": "✅ Approve", "callback_data": f"approve:{request_id}"},
         ]
-        if session_id:
+        # confirm-hard rules pass allow_session_grant=False: no Allow-10-min
+        # button, because that grant would be dead weight (the rule ignores it).
+        if session_id and allow_session_grant:
             buttons.append({"text": "⏱ Allow 10 min (session)", "callback_data": f"allow1m:{request_id}"})
         buttons.append({"text": "❌ Reject", "callback_data": f"reject:{request_id}"})
         keyboard = {
@@ -1659,7 +1682,11 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
     Client info (clientHost, clientIp) is injected from the request context
     so policy rules can match on the calling client's identity.
 
-    Supports actions: allow, deny, inject_argument, confirm.
+    Supports actions: allow, deny, inject_argument, confirm, confirm-hard.
+
+    confirm may be short-circuited by an automatic grant (skill bypass token /
+    session allowance); confirm-hard ignores every such grant and always asks
+    the operator in Telegram.
     """
     async def handler(**kw):
         # Check if backend is healthy before attempting to forward
@@ -1695,8 +1722,12 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     rule_matched = True
                     break
 
-                elif action == "confirm":
+                elif action in CONFIRM_ACTIONS:
                     # --- Confirm action: ask operator for approval ---
+                    # Two levels, selected by the rule's action value:
+                    #   confirm      - bypassable (skill token / session allowance)
+                    #   confirm-hard - bypass-proof, always a human decision
+                    hard = action == "confirm-hard"
                     # If the operator previously granted a short-lived (60s) allowance for THIS
                     # exact rule on this MCP session, skip the Telegram confirm flow entirely.
 
@@ -1706,7 +1737,8 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     # confirm flow entirely. Deny rules already ran before this point.
                     _ih = _incoming_headers_effective()
                     _tok = os.environ.get("SKILLS_BYPASS_TOKEN", "")
-                    if (_tok and _ih.get("X-Skill-Bypass") == _tok
+                    # confirm-hard is BYPASS-PROOF: the skill token cannot skip it.
+                    if (not hard and _tok and _ih.get("X-Skill-Bypass") == _tok
                             and (_request_path.get() or "").rstrip("/") == "/mcp/skills"):
                         # Collect injections from the confirm rule too (e.g., KUBECONFIG
                         # for kubectl/virtctl) so the tool actually works when bypassed.
@@ -1717,7 +1749,9 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                                  bc.name, tn, _ih.get("X-Skill-Name", "unknown"))
                         break
                     allowance_key = _allowance_key(info, bc.name, rule_index)
-                    if _temp_allow_active(allowance_key):
+                    # confirm-hard also refuses the operator's session allowance:
+                    # the rule exists precisely so every call asks a human.
+                    if not hard and _temp_allow_active(allowance_key):
                         # Grant still unexpired — bypass confirm, treat as allow (injections
                         # collected from earlier inject_argument rules are still applied).
                         rule_matched = True
@@ -1788,6 +1822,10 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         timeout = _notification_config.timeout
                     if timeout is None:
                         timeout = 300
+                    if hard and timeout > CONFIRM_HARD_MAX_WAIT_SECONDS:
+                        # Cap a confirm-hard wait so it resolves inside the caller's
+                        # tool-call wall (see CONFIRM_HARD_MAX_WAIT_SECONDS).
+                        timeout = CONFIRM_HARD_MAX_WAIT_SECONDS
 
                     # Send approval request via Telegram
                     sent = await _telegram_backend.send_approval_request(
@@ -1799,6 +1837,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         backend_name=bc.name,
                         session_id=sid,
                         notify_text=notify_text,
+                        allow_session_grant=not hard,
                     )
                     if not sent:
                         _pending_requests.pop(request_id, None)
@@ -1828,6 +1867,37 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         # Edit the Telegram message to show timed out status
                         await _telegram_backend.edit_request_timeout(request_id)
                         _pending_requests.pop(request_id, None)
+                        if hard:
+                            # confirm-hard: typed, NON-FATAL outcome. The caller is a
+                            # pre-approved skill with no interactive surface, so an
+                            # error would read to it as a denial. awaiting_approval says
+                            # exactly what happened: a human has not answered yet, the
+                            # call did NOT run, and the same call can be retried once the
+                            # approval lands in Telegram.
+                            log.warning(
+                                "Tool call %s.%s AWAITING_APPROVAL (confirm-hard, no "
+                                "operator answer in %ss, request %s)",
+                                bc.name, tn, timeout, request_id[:8],
+                            )
+                            return CallToolResult(
+                                content=[TextContent(
+                                    type="text",
+                                    text=(f"awaiting_approval: {tn} on {bc.name} is "
+                                          f"waiting for a human decision in Telegram "
+                                          f"(request {request_id[:8]}...); no answer "
+                                          f"within {timeout}s, so the call did not run. "
+                                          + timeout_template),
+                                )],
+                                structuredContent={
+                                    "status": "awaiting_approval",
+                                    "backend": bc.name,
+                                    "tool": tn,
+                                    "request_id": request_id,
+                                    "timeout_seconds": timeout,
+                                    "resolved": False,
+                                },
+                                isError=False,
+                            )
                         return _error_result(timeout_template)
 
                     _stop_ticker()
@@ -2252,7 +2322,7 @@ async def create_compound_server(compound: CompoundConfig,
                                     injections.update(resolve_injections(rule.get("inject", {})))
                                     break
 
-                                elif action == "confirm":
+                                elif action in CONFIRM_ACTIONS:
                                     # Confirm action - delegate to backend handler
                                     compound_handler = make_policy_handler(
                                         backend_cfg, backend_rules, original_name, backend_st

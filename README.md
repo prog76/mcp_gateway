@@ -50,6 +50,7 @@ supervision.
 | `MCP_CONFIRM_PROGRESS_INTERVAL` | `5.0` |
 | `MCP_REQUEST_HEADER_CAPTURE` | *(empty — disabled)* |
 | `MCP_TEMP_ALLOW_SECONDS` | `600` |
+| `MCP_CONFIRM_HARD_TIMEOUT_SECONDS` | `90` |
 
 `MCP_CONFIRM_PROGRESS_INTERVAL` — cadence (seconds) for MCP progress
 notifications sent to a calling agent while it is blocked on a Telegram
@@ -80,6 +81,28 @@ backend name, rule index)` so the client-supplied header alone can't be spoofed 
 inherit another session's grant. Allowances are stored in memory and expire on gateway
 restart. No notification is sent to the operator for bypassed calls — the agent just
 executes. Logged for audit at INFO level.
+
+### confirm-hard — bypass-proof approval
+
+Policy actions come in two approval flavours (and an unknown action still means
+allow, so spell them exactly):
+
+| action | X-Skill-Bypass token | Allow-10-min (session) grant |
+|---|---|---|
+| `confirm` | skips the ask | skips the ask |
+| `confirm-hard` | **ignored** | **ignored** (button not offered) |
+
+`confirm-hard` opens the normal Telegram approve/reject flow for **every** call —
+no token, no session allowance. It exists for callers that are themselves
+pre-approved: a skill carrying the bypass token must not be able to approve its
+own writes (`write_playbook_script` / `write_skill_md` in skills-ipybox.yaml).
+
+A confirm-hard wait is capped by `MCP_CONFIRM_HARD_TIMEOUT_SECONDS` (default 90,
+and never above the rule's own `timeout:`) so it resolves inside the caller's
+120s tool-call wall. On expiry the gateway does NOT return an error: it returns
+a typed result with `structuredContent.status = "awaiting_approval"`
+(isError=false) naming backend/tool/request id — the call did NOT run and may be
+retried once the operator approves in Telegram.
 
 ## Compound headers → policy injection
 

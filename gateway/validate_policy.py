@@ -86,7 +86,7 @@ def _validate_backend_policy(raw: dict, path: str) -> bool:
 
         # Validate confirm action has required template fields
         action = rule.get("action", "deny")
-        if action == "confirm":
+        if action in ("confirm", "confirm-hard"):
             # confirm_pending, confirm_denied, confirm_timeout, confirm_approved are optional
             # but we should warn if none are provided
             has_templates = any(
@@ -102,7 +102,7 @@ def _validate_backend_policy(raw: dict, path: str) -> bool:
                     for var in re.findall(r'\$\{(.+?)\}', tpl):
                         if var not in ("tool", "backend", "reason", "result") and not var.startswith("args.") and not var.startswith("header:") and not var.startswith("request_header:") and var not in ("clientHost", "clientIp") and not var.startswith("env:"):
                             print(f"WARNING: Rule {i}: unknown template variable '${{{var}}}' in {tpl_field}")
-        elif action not in ("allow", "deny", "inject_argument", "confirm"):
+        elif action not in ("allow", "deny", "inject_argument", "confirm", "confirm-hard"):
             print(f"WARNING: Rule {i}: unknown action '{action}' — treated as allow")
 
     # Check for unreachable rules after catch-all allow
