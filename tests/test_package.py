@@ -1503,7 +1503,10 @@ def test_skill_bypass_skips_confirm_but_not_confirm_hard(monkeypatch):
         sc = out.structuredContent
         assert sc is not None and sc.get("status") == "awaiting_approval"
         assert sc.get("resolved") is False and sc.get("tool") == "write_playbook_script"
-        assert out.isError is False
+        # isError=True is the DELIBERATE part of the typed contract: this call
+        # did not run, and an MCP client only skips outputSchema validation
+        # (which such tools advertise) for an error result (t_93e4d6c5).
+        assert out.isError is True
         assert policy_proxy._pending_requests == {}
     finally:
         policy_proxy.forward = orig_forward
@@ -1563,7 +1566,8 @@ def test_confirm_hard_ignores_session_allowance(monkeypatch):
         assert forwarded == ["run_skill"]  # not forwarded
         sc = out.structuredContent
         assert sc is not None and sc.get("status") == "awaiting_approval"
-        assert out.isError is False
+        # Deliberate: see test_skill_bypass_skips_confirm_but_not_confirm_hard.
+        assert out.isError is True
     finally:
         policy_proxy.forward = orig_forward
         policy_proxy._telegram_backend = orig_tg
@@ -1672,3 +1676,134 @@ def test_unknown_action_is_denied_not_allowed():
         assert forwarded == ["safe"]
     finally:
         policy_proxy.forward = orig_forward
+
+
+# ---------------------------------------------------------------------------
+# confirm expiry must be distinguishable from a DENIAL - kanban t_93e4d6c5.
+#
+# The incident: git_push (a plain `confirm` rule) expired twice while the
+# operator was not watching, and came back as a bare
+# "ACCESS DENIED: Approval request timed out." - textually identical to a
+# policy refusal - which is exactly what made routing around the gate look
+# like the reasonable move. These tests pin the contract that replaced it.
+# ---------------------------------------------------------------------------
+
+
+def _run_confirm_expiry(tool="git_push", action="confirm", rule_extra=None):
+    """Run a confirm rule to EXPIRY (no operator answer) and return the result."""
+    bc = policy_proxy.BackendConfig(name="git", url="http://git/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="git", healthy=True)
+    rule = {"match": {"tool": ".*"}, "action": action, "timeout": 0.05}
+    rule.update(rule_extra or {})
+    forwarded = []
+    missed = []
+
+    class ExpiringTelegram:
+        async def send_approval_request(self, **kw):
+            return True
+
+        async def edit_request_timeout(self, request_id):
+            missed.append(("edit", request_id))
+
+        async def notify_missed_approval(self, **kw):
+            missed.append(("ping", kw))
+
+    async def fake_forward(bc, tool_name, arguments):
+        forwarded.append(tool_name)
+        return {"content": ["pushed"], "structuredContent": None, "isError": False}
+
+    orig_tg = policy_proxy._telegram_backend
+    orig_forward = policy_proxy.forward
+    try:
+        policy_proxy._telegram_backend = ExpiringTelegram()
+        policy_proxy.forward = fake_forward
+        handler = policy_proxy.make_policy_handler(bc, [rule], tool, status)
+        out = asyncio.run(handler(remote="origin", branch="main"))
+        return out, forwarded, missed
+    finally:
+        policy_proxy._telegram_backend = orig_tg
+        policy_proxy.forward = orig_forward
+        policy_proxy._pending_requests.clear()
+
+
+def test_confirm_expiry_is_typed_not_a_denial():
+    """A confirm wait that expires while the operator is away must NOT come back
+    as a bare denial: the caller has to be able to tell 'nobody answered yet, the
+    call did not run, retry' from 'policy forbids this, stop trying'."""
+    out, forwarded, _missed = _run_confirm_expiry()
+    text = out.content[0].text
+
+    assert forwarded == [], "an expired approval must not have run the call"
+    assert text.startswith("awaiting_approval:"), text
+    assert "ACCESS DENIED" not in text
+    assert "retryable=true" in text
+    # The machine-readable half rides along for callers that keep it.
+    sc = out.structuredContent
+    assert sc is not None
+    assert sc["status"] == "awaiting_approval"
+    assert sc["backend"] == "git" and sc["tool"] == "git_push"
+    assert sc["resolved"] is False and sc["retryable"] is True
+    assert sc["request_id"] and sc["timeout_seconds"] == 0.05
+    # isError=True is deliberate: it is what makes an MCP client skip
+    # outputSchema validation for a tool that advertises one (git_push does).
+    assert out.isError is True
+    assert policy_proxy._pending_requests == {}
+
+
+def test_confirm_expiry_applies_to_confirm_hard_too():
+    """Same typed contract for the bypass-proof tier - an expiry means exactly
+    the same thing there, so the caller must not have to special-case it."""
+    out, forwarded, _missed = _run_confirm_expiry(tool="write_skill_md",
+                                                 action="confirm-hard")
+    assert forwarded == []
+    assert out.structuredContent["status"] == "awaiting_approval"
+    assert "ACCESS DENIED" not in out.content[0].text
+
+
+def test_confirm_expiry_pings_the_operator():
+    """A missed approval must not vanish silently: the timeout edit runs AND a
+    follow-up message names the tool, so an operator who was away learns that a
+    call is still parked on their answer."""
+    _out, _fwd, missed = _run_confirm_expiry()
+    kinds = [k for k, _ in missed]
+    assert "edit" in kinds, "the original message must be marked timed out"
+    assert "ping" in kinds, "a follow-up notification must be sent"
+    ping = dict(missed)["ping"]
+    assert ping["tool_name"] == "git_push" and ping["backend_name"] == "git"
+
+
+def test_timeout_keeps_the_approve_button_alive():
+    """The timeout edit must NOT strip the inline keyboard: a late Approve is
+    still a valid answer, and stripping it turned a missed ask into a dead end
+    that could only be resolved by repeating the call."""
+    calls = []
+
+    class StubResp:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 7, "chat": {"id": 42}}}
+
+    class StubClient:
+        async def post(self, url, **kw):
+            calls.append((url, kw.get("json")))
+            return StubResp()
+
+    backend = policy_proxy.TelegramBackend(bot_token="x", chat_id="42")
+    backend._client = StubClient()
+    pending = policy_proxy.PendingRequest(request_id="rid1234")
+    pending.message_id = 7
+    pending.chat_id = 42
+    policy_proxy._pending_requests["rid1234"] = pending
+    try:
+        asyncio.run(backend.edit_request_timeout("rid1234"))
+    finally:
+        policy_proxy._pending_requests.clear()
+
+    assert calls, "the message must be edited"
+    _url, payload = calls[0]
+    assert "reply_markup" not in payload, (
+        "timeout must keep the keyboard; removing it makes the ask unresolvable")
+    assert "ACCESS DENIED" not in payload["text"]
+    assert "did NOT run" in payload["text"]

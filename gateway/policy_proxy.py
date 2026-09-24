@@ -946,20 +946,49 @@ class TelegramBackend:
             pass
 
     async def edit_request_timeout(self, request_id: str):
-        """Edit the approval request message to show timeout status."""
+        """Mark an approval request as timed out, WITHOUT killing it.
+
+        The original dropped the inline keyboard here, which turned a missed
+        ask into a dead end: nothing left in the chat could resolve the
+        request, so the only way forward was for the caller to repeat the call
+        and hope the operator was watching. A late answer is still a valid
+        answer - the reply is idempotent ("Request expired or unknown" once
+        there is nothing left to resolve) - so the buttons stay.
+        """
         pending = _pending_requests.get(request_id)
         if not pending or not pending.message_id or not pending.chat_id:
             return
 
-        # Build timeout status message
         timeout_text = (
             f"⏰ Approval Request Timed Out\n"
             f"Request ID: {request_id[:8]}...\n"
-            f"Status: timed out\n"
+            f"Status: timed out — the call did NOT run and can be retried.\n"
+            f"Buttons stay live: a late Approve still records the decision.\n"
         )
 
-        # Edit the existing message (keep or remove keyboard as needed)
-        await self._edit_message(pending.chat_id, pending.message_id, timeout_text, remove_keyboard=True)
+        # Keep the keyboard: a late Approve is still useful.
+        await self._edit_message(pending.chat_id, pending.message_id, timeout_text,
+                                 remove_keyboard=False)
+
+    async def notify_missed_approval(self, request_id: str, tool_name: str,
+                                     backend_name: str = "",
+                                     timeout_seconds: float = 0) -> None:
+        """Follow-up ping so a missed approval cannot go unnoticed.
+
+        The timeout edit rewrites the ORIGINAL message in place, which is easy
+        to scroll past in a busy chat. This posts a NEW message naming the tool
+        and saying plainly that nothing ran and nothing was refused.
+        """
+        label = f"{backend_name}/{tool_name}" if backend_name else tool_name
+        await self.send_message(
+            text=(f"⏰ Approval MISSED — the call did not run.\n"
+                  f"Tool: {label}\n"
+                  f"Request: {request_id[:8]}... (no operator answer within "
+                  f"{int(timeout_seconds)}s)\n"
+                  f"Nothing was executed and nothing was refused. To let it "
+                  f"through, approve it (the buttons on the original message "
+                  f"are still live) or watch for the retry.")
+        )
 
     async def shutdown(self):
         self._running = False
@@ -1660,6 +1689,61 @@ async def _run_confirm_progress_ticker(relay, request_id: str, timeout: int,
             break
 
 
+def _approval_pending_result(bc_name: str, tool_name: str, request_id: str,
+                             timeout: float, detail: str) -> CallToolResult:
+    """Typed result for a confirm wait that expired with NO operator answer.
+
+    A timeout is not a denial and must never read like one. The incident behind
+    this contract (kanban t_93e4d6c5): ``git_push`` came back as the bare
+    ``ACCESS DENIED: Approval request timed out.`` — textually identical to a
+    policy refusal — twice in a row, so the cheapest apparent fix was to route
+    around the gate entirely. A gate that can be mistaken for broken
+    manufactures the incentive to bypass it, so the message is part of the
+    control, not a nicety.
+
+    Every field is load-bearing:
+
+    * ``isError=True`` is NOT cosmetic. ``git_push`` advertises an outputSchema
+      whose ``required`` fields are the push outcome and whose
+      ``additionalProperties`` is false, and the MCP SDK client validates
+      ``structuredContent`` against that schema whenever ``isError`` is false
+      (mcp/client/session.py::_validate_tool_result). A non-error result would
+      therefore have to satisfy the TOOL's schema, which has nowhere to put a
+      ``status`` field. Marking it an error skips client-side validation, so
+      the caller gets this text instead of a transport-level
+      "has an output schema but did not return structured content".
+    * the text LEADS with ``awaiting_approval:`` and never contains
+      ``ACCESS DENIED``. Text is the channel the agent reliably sees (Hermes'
+      MCP client drops structuredContent once a result is an error), so it has
+      to be self-identifying and greppable.
+    * ``retryable=true`` states the required behaviour outright: the call did
+      NOT run, and the same call may be retried once the operator has answered.
+    * ``structuredContent`` still rides along for callers that keep it
+      (mcp2cli / py-skills render text + structured content as JSON).
+    """
+    secs = int(timeout) if float(timeout).is_integer() else timeout
+    text = (
+        f"awaiting_approval: {tool_name} on {bc_name} is waiting for a human "
+        f"decision in Telegram (request {request_id[:8]}...). No answer within "
+        f"{secs}s, so the call did NOT run — this is NOT a denial and no policy "
+        f"refused it. retryable=true: ask the operator to answer the approval, "
+        f"then retry the same call. {detail}"
+    )
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={
+            "status": "awaiting_approval",
+            "backend": bc_name,
+            "tool": tool_name,
+            "request_id": request_id,
+            "timeout_seconds": secs,
+            "resolved": False,
+            "retryable": True,
+        },
+        isError=True,
+    )
+
+
 def _error_result(text: str) -> CallToolResult:
     """Return an ``isError`` CallToolResult for policy-failure exits.
 
@@ -1793,7 +1877,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         tn, {**policy_kw, "reason": reason},
                     )
                     timeout_template = resolve_template(
-                        rule.get("confirm_timeout", "ACCESS DENIED: Approval request timed out."),
+                        rule.get("confirm_timeout", "The operator did not answer in time."),
                         tn, policy_kw,
                     )
                     approved_template = rule.get("confirm_approved",
@@ -1867,38 +1951,33 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         # Edit the Telegram message to show timed out status
                         await _telegram_backend.edit_request_timeout(request_id)
                         _pending_requests.pop(request_id, None)
-                        if hard:
-                            # confirm-hard: typed, NON-FATAL outcome. The caller is a
-                            # pre-approved skill with no interactive surface, so an
-                            # error would read to it as a denial. awaiting_approval says
-                            # exactly what happened: a human has not answered yet, the
-                            # call did NOT run, and the same call can be retried once the
-                            # approval lands in Telegram.
-                            log.warning(
-                                "Tool call %s.%s AWAITING_APPROVAL (confirm-hard, no "
-                                "operator answer in %ss, request %s)",
-                                bc.name, tn, timeout, request_id[:8],
-                            )
-                            return CallToolResult(
-                                content=[TextContent(
-                                    type="text",
-                                    text=(f"awaiting_approval: {tn} on {bc.name} is "
-                                          f"waiting for a human decision in Telegram "
-                                          f"(request {request_id[:8]}...); no answer "
-                                          f"within {timeout}s, so the call did not run. "
-                                          + timeout_template),
-                                )],
-                                structuredContent={
-                                    "status": "awaiting_approval",
-                                    "backend": bc.name,
-                                    "tool": tn,
-                                    "request_id": request_id,
-                                    "timeout_seconds": timeout,
-                                    "resolved": False,
-                                },
-                                isError=False,
-                            )
-                        return _error_result(timeout_template)
+                        # A missed ask must not vanish silently: the approval
+                        # message just lost its buttons, and an operator who
+                        # scrolled past it would otherwise never learn that a
+                        # call is still parked on their answer. Best-effort -
+                        # a notification failure must never break the typed
+                        # result the caller needs.
+                        _missed = getattr(_telegram_backend, "notify_missed_approval", None)
+                        if _missed is not None:
+                            with contextlib.suppress(Exception):
+                                await _missed(
+                                    request_id=request_id, tool_name=tn,
+                                    backend_name=bc.name, timeout_seconds=timeout,
+                                )
+                        log.warning(
+                            "Tool call %s.%s AWAITING_APPROVAL (%s, no operator "
+                            "answer in %ss, request %s)",
+                            bc.name, tn, action, timeout, request_id[:8],
+                        )
+                        # Same typed, non-fatal contract for BOTH tiers: the
+                        # incident was a plain `confirm` (git_push), and an
+                        # expiry means the same thing either way - a human has
+                        # not answered, so the call did not run and can be
+                        # retried. Only the ask itself differs (confirm-hard
+                        # cannot be auto-granted).
+                        return _approval_pending_result(
+                            bc.name, tn, request_id, timeout, timeout_template,
+                        )
 
                     _stop_ticker()
                     _pending_requests.pop(request_id, None)

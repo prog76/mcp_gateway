@@ -84,8 +84,8 @@ executes. Logged for audit at INFO level.
 
 ### confirm-hard — bypass-proof approval
 
-Policy actions come in two approval flavours (and an unknown action still means
-allow, so spell them exactly):
+Policy actions come in two approval flavours (and an unknown action means
+DENY since v0.1.38, so spell them exactly):
 
 | action | X-Skill-Bypass token | Allow-10-min (session) grant |
 |---|---|---|
@@ -99,10 +99,40 @@ own writes (`write_playbook_script` / `write_skill_md` in skills-ipybox.yaml).
 
 A confirm-hard wait is capped by `MCP_CONFIRM_HARD_TIMEOUT_SECONDS` (default 90,
 and never above the rule's own `timeout:`) so it resolves inside the caller's
-120s tool-call wall. On expiry the gateway does NOT return an error: it returns
-a typed result with `structuredContent.status = "awaiting_approval"`
-(isError=false) naming backend/tool/request id — the call did NOT run and may be
-retried once the operator approves in Telegram.
+120s tool-call wall.
+
+### Approval expiry: typed, retryable, and NOT a denial (both tiers)
+
+When a `confirm` or `confirm-hard` wait expires with no operator answer, the
+gateway returns a TYPED result instead of the old bare
+`ACCESS DENIED: Approval request timed out.` (kanban t_93e4d6c5 — that text
+was identical to a policy refusal, which made routing around the gate look
+reasonable):
+
+```text
+awaiting_approval: <tool> on <backend> is waiting for a human decision in
+Telegram (request <id8>...). No answer within <n>s, so the call did NOT run —
+this is NOT a denial and no policy refused it. retryable=true: ask the
+operator to answer the approval, then retry the same call. <timeout template>
+```
+
+plus `structuredContent = {status:"awaiting_approval", backend, tool,
+request_id, timeout_seconds, resolved:false, retryable:true}`.
+
+`isError` is **true**, and that is deliberate: tools like `git_push` advertise
+an outputSchema whose required fields are the push outcome, and the MCP SDK
+client validates `structuredContent` against that schema whenever `isError` is
+false — a non-error result would raise a transport-level schema error instead of
+reaching the caller (measured, this card's probe). An error result skips that
+validation, so the agent sees the `awaiting_approval` text. Agent contract: on
+this result RETRY the same call (or wait for the operator's answer) — never
+treat it as a refusal, and never look for a bypass.
+
+The default `confirm_timeout` text no longer says `ACCESS DENIED` (a per-rule
+`confirm_timeout:` override is still honoured verbatim). On expiry the gateway
+also posts a follow-up Telegram message naming the tool (so a missed ask cannot
+go unnoticed), and the timeout edit now KEEPS the Approve/Reject buttons — a
+late answer is still valid.
 
 ## Compound headers → policy injection
 
