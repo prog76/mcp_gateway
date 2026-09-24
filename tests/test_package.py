@@ -1635,3 +1635,40 @@ def test_validate_policy_accepts_confirm_hard(tmp_path):
     ]
     p.write_text(chr(10).join(rows))
     assert validate_policy.validate_policy(str(p)) is True
+
+
+def test_unknown_action_is_denied_not_allowed():
+    """The catch-all for an unrecognised action is DENY, not allow.
+    
+    Policy YAML is a live bind mount while the gateway image is not, so an
+    action the running gateway does not know (a typo, or a newer action such
+    as confirm-hard deployed before its gateway) must fail CLOSED. It used
+    to mean allow, which silently made such a rule bypass-free.
+    """
+    bc = policy_proxy.BackendConfig(name="demo", url="http://demo/mcp", transport="http")
+    status = policy_proxy.BackendStatus(name="demo", healthy=True)
+    forwarded = []
+
+    async def fake_forward(bc, tool_name, arguments):
+        forwarded.append(tool_name)
+        return {"content": ["ran"], "structuredContent": None, "isError": False}
+
+    orig_forward = policy_proxy.forward
+    try:
+        policy_proxy.forward = fake_forward
+
+        # Unknown action -> denied, NOT forwarded.
+        h = policy_proxy.make_policy_handler(
+            bc, [{"match": {"tool": ".*"}, "action": "confim-hard"}], "dangerous", status)
+        out = asyncio.run(h(a=1))
+        assert forwarded == [], "unknown action must not forward"
+        assert out.isError is True
+        assert "ACCESS DENIED" in out.content[0].text
+
+        # Explicit allow still works (it must not rely on the catch-all).
+        h = policy_proxy.make_policy_handler(
+            bc, [{"match": {"tool": ".*"}, "action": "allow"}], "safe", status)
+        asyncio.run(h(a=1))
+        assert forwarded == ["safe"]
+    finally:
+        policy_proxy.forward = orig_forward

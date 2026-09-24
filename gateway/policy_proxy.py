@@ -1945,10 +1945,33 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                         return _error_result(rendered)
                     return rendered
 
-                else:
-                    # Unknown action — treat as allow
+                elif action == "allow":
+                    # Explicit: `allow` used to fall through the catch-all
+                    # `else` below, which is exactly why that `else` could not
+                    # be tightened on its own.
                     rule_matched = True
                     break
+
+                else:
+                    # Unknown action — CLOSED DEFAULT (deny).
+                    #
+                    # This used to mean `allow`. That made a policy/code
+                    # version skew silently PERMISSIVE: policies are a live
+                    # bind mount, the gateway code is not, so a new action
+                    # (e.g. confirm-hard) written into a policy before the
+                    # gateway that understands it is deployed matched this
+                    # branch and ran with NO approval at all — the exact
+                    # opposite of the intent. A typo has the same effect.
+                    log.error(
+                        "Tool call %s.%s DENIED: unknown policy action %r (rule %d)",
+                        bc.name, tn, action, rule_index,
+                    )
+                    return _error_result(
+                        f"ACCESS DENIED: rule {rule_index} for {tn} uses unknown "
+                        f"action {action!r}; deny is the safe default. Fix the "
+                        f"policy (valid: allow, deny, inject_argument, "
+                        f"confirm, confirm-hard).",
+                    )
 
         else:
             reason = resolve_template(bc.default_deny, tn, policy_kw)
@@ -2329,8 +2352,19 @@ async def create_compound_server(compound: CompoundConfig,
                                     )
                                     return await compound_handler(**kw)
 
-                                else:
+                                elif action == "allow":
+                                    rule_matched = True
                                     break
+
+                                else:
+                                    # Unknown action — CLOSED DEFAULT (deny);
+                                    # see make_policy_handler for why this is
+                                    # not `allow` any more.
+                                    log.error(
+                                        "Tool call %s.%s DENIED: unknown policy action %r",
+                                        backend_cfg.name, original_name, action,
+                                    )
+                                    return f"ACCESS DENIED: unknown policy action {action!r}"
 
                         # Apply injections
                         if injections:
