@@ -506,3 +506,133 @@ def test_redaction():
         assert "sup3r-secret-value" not in json.dumps(out)
     finally:
         del os.environ["MAIL_FETCH_PROG76_PASSWORD"]
+
+
+
+
+# ---------------------------------------------------------------------------
+# Folder resolution: a caller names a CHANNEL, the server has its own names
+# ---------------------------------------------------------------------------
+#
+# imap.mail.ru has NO folder called "Trash". SELECT "Trash" answers
+# NO [NONEXISTENT]; the real folder is stored under its mUTF-7 spelling and
+# carries the RFC 6154 special-use flag. The first live acceptance run (VDI,
+# 2026-09-25) therefore scanned INBOX only and reported the reference letter
+# as not_found while it sat in that Trash. These tests hold the resolution.
+
+MUTF7_TRASH = "&BBoEPgRABDcEOAQ9BDA-"
+CYR_TRASH = "Корзина"
+
+
+def _listing_entry(flag, name):
+    q = chr(34)
+    return "(" + chr(92) + flag + ") " + q + "/" + q + " " + q + name + q
+
+
+LISTING = [_listing_entry("Trash", MUTF7_TRASH),
+           _listing_entry("Inbox", "INBOX"),
+           _listing_entry("Sent", "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-")]
+
+_HEAD = (CRLF.join([
+    "From: GitHub <noreply@github.com>",
+    "To: rs2qeug3kpxg@mail.ru",
+    "Delivered-To: rs2qeug3kpxg@mail.ru",
+    "Subject: Your GitHub launch code",
+    "Date: Tue, 16 Sep 2026 09:55:00 +0300",
+]) + CRLF + CRLF).encode()
+
+_LETTER = _HEAD + (CRLF.join([
+    "Your GitHub launch code is:", "", REAL_CODE, "", REAL_LINK]) + CRLF).encode()
+
+
+class _FakeIMAP:
+    """mail.ru-shaped server: ASCII folder names are absent, mUTF-7 ones are real."""
+
+    def __init__(self, boxes, listing=None):
+        self.boxes = boxes
+        self.listing = LISTING if listing is None else listing
+        self._cur = None
+        self.selects = []
+
+    def starttls(self, ssl_context=None):
+        return "OK", [b"ok"]
+
+    def login(self, user, pw):
+        return "OK", [b"ok"]
+
+    def list(self):
+        return "OK", [line.encode() for line in self.listing]
+
+    def select(self, name, readonly=False):
+        name = name.decode() if isinstance(name, bytes) else name
+        self.selects.append(name)
+        if name in self.boxes:
+            self._cur = name
+            return "OK", [str(len(self.boxes[name])).encode()]
+        return "NO", [b"[NONEXISTENT] Folder not exists"]
+
+    def uid(self, cmd, *args):
+        if cmd.upper() == "SEARCH":
+            return "OK", [b" ".join(u.encode() for u in self.boxes[self._cur])]
+        uid = args[0]
+        if "HEADER.FIELDS" in str(args[1]):
+            return "OK", [(b"1 (UID " + uid.encode()
+                           + b" BODY[HEADER.FIELDS (X)] {0}", _HEAD)]
+        return "OK", [(b"1 (UID " + uid.encode() + b" BODY[] {0}", _LETTER)]
+
+    def logout(self):
+        return "BYE", [b"bye"]
+
+
+def _fake_open(fake):
+    return lambda account, timeout: (fake, 143, "starttls")
+
+
+def test_mutf7_roundtrip():
+    assert mm._mutf7_decode(MUTF7_TRASH) == CYR_TRASH
+    assert mm._mutf7_decode("INBOX") == "INBOX"
+    assert mm._mutf7_decode("&-") == "&"
+    assert mm._mutf7_encode(CYR_TRASH) == MUTF7_TRASH
+    assert mm._mutf7_encode("INBOX") == "INBOX"
+
+
+def test_folder_candidates_prefer_the_special_use_folder():
+    listing = mm._list_folders(_FakeIMAP({}))
+    cands = mm._folder_candidates("Trash", {}, listing)
+    names = [c["imap_name"] for c in cands]
+    assert "Trash" in names            # the cheap probe comes first
+    assert MUTF7_TRASH in names        # the server's real spelling
+    how = [c["how"] for c in cands if c["imap_name"] == MUTF7_TRASH][0]
+    assert how == "special-use"
+
+
+def test_folder_candidates_honour_a_config_override():
+    cands = mm._folder_candidates("Trash", {"Trash": "Korzina"}, [])
+    assert cands[0] == {"imap_name": "Korzina", "how": "config"}
+
+
+def test_scan_finds_the_letter_in_mutf7_trash(monkeypatch):
+    fake = _FakeIMAP({"INBOX": [], MUTF7_TRASH: ["16463"]})
+    monkeypatch.setattr(mm, "_open", _fake_open(fake))
+    monkeypatch.setenv("MAIL_FETCH_PROG76_PASSWORD", "a-dummy-not-a-secret")
+    out = _run(mm._tool_fetch(account="prog76@mail.ru", from_filter="github.com",
+                              alias="rs2qeug3kpxg@mail.ru",
+                              subject_contains="launch code"))
+    assert out["ok"] is True
+    assert out["count"] == 1, out.get("diag")
+    assert out["matches"][0]["code"] == REAL_CODE
+    assert out["matches"][0]["folder"] == "Trash"
+    assert out["matches"][0]["imap_folder"] == MUTF7_TRASH
+    assert out["diag"]["folder_used"]["Trash"]["how"] == "special-use"
+    assert MUTF7_TRASH in fake.selects
+
+
+def test_scan_reports_a_folder_it_cannot_resolve(monkeypatch):
+    fake = _FakeIMAP({"INBOX": []}, listing=[_listing_entry("Inbox", "INBOX")])
+    monkeypatch.setattr(mm, "_open", _fake_open(fake))
+    monkeypatch.setenv("MAIL_FETCH_PROG76_PASSWORD", "a-dummy-not-a-secret")
+    out = _run(mm._tool_fetch(account="prog76@mail.ru", from_filter="github.com",
+                              alias="rs2qeug3kpxg@mail.ru"))
+    assert out["ok"] is True and out["found"] is False
+    assert "Trash" in out["diag"]["folder_errors"]
+    assert out["diag"]["folder_candidates"]["Trash"]

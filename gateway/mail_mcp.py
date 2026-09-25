@@ -366,6 +366,159 @@ def _msg_ts(msg):
 # IMAP
 # ---------------------------------------------------------------------------
 
+# ---- folder channels (added 2026-09-25, card t_fbe11d78) ------------------
+# imap.mail.ru has NO folder named "Trash": SELECT answers NO [NONEXISTENT]
+# while the real folder is stored in mUTF-7 as &BBoEPgRABDcEOAQ9BDA- (Korzina)
+# and carries the RFC 6154 special-use flag. A folder that cannot be SELECTed
+# silently means FEWER folders scanned than the operator configured - which is
+# exactly how the first live acceptance run missed the reference letter while
+# it sat in that Trash. So a configured folder is a CHANNEL, resolved against
+# the server's own LIST output, never assumed from its name.
+_BACKSLASH = chr(92)
+_QUOTE = chr(34)
+
+_SPECIAL_USE = {
+    "trash": ("TRASH",),
+    "sent": ("SENT",),
+    "drafts": ("DRAFTS",),
+    "junk": ("JUNK",),
+    "spam": ("JUNK",),
+    "archive": ("ARCHIVE", "ALL"),
+    "all": ("ALL", "ARCHIVE"),
+    "inbox": ("INBOX",),
+}
+
+
+def _mutf7_decode(name: str) -> str:
+    """Decode an IMAP modified-UTF-7 mailbox name (RFC 3501, section 5.1.3)."""
+    import base64
+    out: List[str] = []
+    i = 0
+    while i < len(name):
+        if name[i] != "&":
+            out.append(name[i])
+            i += 1
+            continue
+        j = name.find("-", i)
+        if j < 0:
+            out.append(name[i:])
+            break
+        if j == i + 1:
+            out.append("&")
+            i = j + 1
+            continue
+        chunk = name[i + 1:j].replace(",", "/")
+        try:
+            pad = "=" * (-len(chunk) % 4)
+            out.append(base64.b64decode(chunk + pad).decode("utf-16-be"))
+        except Exception:
+            out.append(name[i:j + 1])
+        i = j + 1
+    return "".join(out)
+
+
+def _mutf7_encode(name: str) -> str:
+    """Inverse of _mutf7_decode; used to build candidate spellings."""
+    import base64
+    out: List[str] = []
+    buf: List[str] = []
+
+    def flush():
+        if not buf:
+            return
+        raw = "".join(buf).encode("utf-16-be")
+        b64 = base64.b64encode(raw).decode().rstrip("=").replace("/", ",")
+        out.append("&" + b64 + "-")
+        del buf[:]
+
+    for ch in name:
+        if 0x20 <= ord(ch) <= 0x7E:
+            flush()
+            out.append("&-" if ch == "&" else ch)
+        else:
+            buf.append(ch)
+    flush()
+    return "".join(out)
+
+
+def _list_folders(imap) -> List[Dict[str, Any]]:
+    """LIST the account once: [{imap_name, flags, human}]. Never fatal."""
+    entries: List[Dict[str, Any]] = []
+    try:
+        typ, data = imap.list()
+    except Exception:
+        return entries
+    if typ != "OK":
+        return entries
+    for raw in data or []:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        if not line.startswith("("):
+            continue
+        close = line.find(")")
+        if close < 0:
+            continue
+        flags = tuple(f.strip().upper() for f in
+                      line[1:close].replace(_BACKSLASH, " ").split() if f.strip())
+        rest = line[close + 1:].strip()
+        node = rest.split(" ", 1)
+        name_part = node[1].strip() if len(node) > 1 else ""
+        if name_part.startswith(_QUOTE):
+            raw_name = name_part.strip(_QUOTE)
+        else:
+            raw_name = name_part
+        if raw_name:
+            entries.append({"imap_name": raw_name, "flags": flags,
+                            "human": _mutf7_decode(raw_name)})
+    return entries
+
+
+def _folder_candidates(channel: str, overrides: Dict[str, str],
+                       listing: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Ordered candidate names for one configured folder CHANNEL.
+
+    1. an explicit operator override (folder_names in the mail config);
+    2. the channel name exactly as written (INBOX and plain ASCII names);
+    3. the mUTF-7 spelling of the channel and of the built-in alias - matched
+       against the server's real listing first, then tried blind;
+    4. any folder whose RFC 6154 special-use flag matches the channel.
+    """
+    chan = (channel or "").strip()
+    low = chan.lower()
+    names: List[Dict[str, str]] = []
+    seen = set()
+
+    def add(name, how):
+        name = (name or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append({"imap_name": name, "how": how})
+
+    add((overrides or {}).get(chan), "config")
+    add((overrides or {}).get(low), "config")
+    add(chan, "as-written")
+    if low == "inbox":
+        return names
+
+    wanted = [chan]
+    wanted += [_mutf7_decode(chan)]
+    wanted += list(_SPECIAL_USE.get(low, ()))
+    for w in wanted:
+        spelled = _mutf7_encode(w) if w else ""
+        if not spelled or spelled == chan:
+            continue
+        exact = [e for e in (listing or []) if e["imap_name"] == spelled]
+        add(spelled if exact else "", "mutf7")
+        if not exact:
+            add(spelled, "mutf7-blind")
+
+    flags = _SPECIAL_USE.get(low, ())
+    if flags:
+        for e in listing or []:
+            if any(f.lstrip(_BACKSLASH).upper() in flags for f in e["flags"]):
+                add(e["imap_name"], "special-use")
+    return names
+
+
 def _open(account: str, timeout: int):
     """Connect + TLS. Returns (imap, port, mode).
 
@@ -541,10 +694,12 @@ def _scope(kw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _letter_view(headers: Dict[str, str], uid: str, folder: str, msg=None):
+def _letter_view(headers: Dict[str, str], uid: str, folder: str,
+                 imap_folder: Optional[str] = None, msg=None):
     """Build the result entry for one matched letter."""
     view = {
         "folder": folder,
+        "imap_folder": imap_folder or folder,
         "uid": uid,
         "from": headers.get("FROM", ""),
         "to": headers.get("TO", "") or headers.get("DELIVERED-TO", ""),
@@ -582,13 +737,14 @@ def _scan(scope: Dict[str, Any]) -> Dict[str, Any]:
 
     targets = [scope["folder"]] if scope["folder"] else list(
         accounts()[account].get("folders") or ())
+    overrides = dict(accounts()[account].get("folder_names") or {})
     diag: Dict[str, Any] = {"account": account, "folders": targets,
                             "filters": {"to": scope["alias"] or None,
                                         "from_filter": scope["from_filter"] or None,
                                         "subject_contains": scope["subject_contains"] or None,
                                         "since": scope["since_raw"],
                                         "uid": scope["uid"]},
-                            "folder_errors": {}}
+                            "folder_errors": {}, "folder_candidates": {}, "folder_used": {}}
     imap = None
     try:
         imap, port, mode = _open(account, scope["timeout"])
@@ -602,13 +758,41 @@ def _scan(scope: Dict[str, Any]) -> Dict[str, Any]:
         matches: List[Dict[str, Any]] = []
         scanned_total = 0
         max_matches = max(1, int(scope.get("max_matches") or limits.get("max_matches", 5)))
+        listing = _list_folders(imap)
+        diag["folders_listed"] = [e["imap_name"] for e in listing]
+        # mail.ru keeps a folder PER ALIAS: letters to an alias can be
+        # filed there instead of INBOX/Trash, so scan it when it exists.
+        if scope["alias"]:
+            want = scope["alias"].strip().lower()
+            for e in listing:
+                if e["imap_name"].lower() == want or e["human"].lower() == want:
+                    if e["imap_name"] not in targets:
+                        targets = list(targets) + [e["imap_name"]]
+                        diag["folders"] = targets
+                        diag["alias_folder"] = e["imap_name"]
+                    break
+        resolved = {}
         for tgt in targets:
-            typ, data = imap.select(tgt, readonly=True)
-            if typ != "OK":
-                # never fatal: an account's exact folder name can differ
-                diag["folder_errors"][tgt] = _redact(str(data))[:160]
+            cands = ([resolved[tgt]] if tgt in resolved
+                     else _folder_candidates(tgt, overrides, listing))
+            diag["folder_candidates"][tgt] = [c["imap_name"] for c in cands]
+            chosen = None
+            last_err = None
+            for cand in cands:
+                typ, data = imap.select(cand["imap_name"], readonly=True)
+                if typ == "OK":
+                    chosen = cand
+                    break
+                last_err = _redact(str(data))[:160]
+            if chosen is None:
+                # never fatal, but never silent either: the report names
+                # every spelling tried and what the server answered.
+                diag["folder_errors"][tgt] = (
+                    "tried %s: %s" % (diag["folder_candidates"][tgt], last_err))
                 continue
-
+            resolved[tgt] = chosen
+            diag["folder_used"][tgt] = chosen
+            imap_box = chosen["imap_name"]
             if scope["since"] is not None:
                 stamp = _dt.datetime.fromtimestamp(
                     scope["since"], _dt.timezone.utc).strftime("%d-%b-%Y")
@@ -640,7 +824,7 @@ def _scan(scope: Dict[str, Any]) -> Dict[str, Any]:
                 if scope["subject_contains"] and \
                         scope["subject_contains"].lower() not in h.get("SUBJECT", "").lower():
                     continue
-                view = _letter_view(h, uid, tgt)
+                view = _letter_view(h, uid, tgt, imap_box)
                 if len(matches) < max_matches:
                     typ, resp = imap.uid("FETCH", uid, "(BODY.PEEK[])")
                     if typ == "OK":
