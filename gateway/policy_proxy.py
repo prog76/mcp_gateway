@@ -54,6 +54,13 @@ from gateway.mounted_server import (
     set_incoming_header_capture,
 )
 import gateway.telegram_mcp as telegram_mcp
+import gateway.mail_mcp as mail_mcp
+
+# In-process ("synthetic") backends: no transport, no port, nothing to discover.
+# Each owns its own tool layer and is dispatched through its own forward().
+# keyed by backend name so a compound listing `mail`/`telegram` resolves to
+# the right handler table.
+_SYNTHETIC_BACKENDS = {"telegram": telegram_mcp, "mail": mail_mcp}
 from gateway import oauth as gateway_oauth
 from gateway.policy_yaml import PolicyLoader
 
@@ -2453,7 +2460,10 @@ async def create_compound_server(compound: CompoundConfig,
                         if getattr(backend_st, "synthetic", False):
                             # In-process backend: no transport and nothing to
                             # discover, so dispatch through its own handler table.
-                            result = await telegram_mcp.forward(original_name, kw)
+                            synthetic_module = _SYNTHETIC_BACKENDS.get(
+                                backend_cfg.name, telegram_mcp
+                            )
+                            result = await synthetic_module.forward(original_name, kw)
                         else:
                             result = await forward(backend_cfg, original_name, kw)
                         if "error" in result:
@@ -2591,6 +2601,11 @@ async def main():
         compound_backend_map = dict(backend_config_map)
         if _telegram_backend is not None:
             compound_backend_map["telegram"] = BackendConfig(name="telegram")
+        # The mail tools are in-process too (no transport, no policy file), so
+        # they are registered here for the same reason: a compound that lists
+        # `mail` must resolve. Whether the mailbox itself is usable is decided
+        # by the mounted mail.yaml (absent accounts = closed).
+        compound_backend_map["mail"] = BackendConfig(name="mail")
         compounds = load_compounds(compounds_path, compound_backend_map)
 
         compound_statuses: List[CompoundStatus] = []
@@ -2606,6 +2621,13 @@ async def main():
             backend_status_map["telegram"] = telegram_mcp.attach_synthetic_backend(
                 BackendStatus, BackendConfig, name="telegram")
             log.info("Telegram tools registered as a synthetic compound backend")
+
+        # Mail tools: same in-process pattern. Registered unconditionally - an
+        # unconfigured mail.yaml makes the backend deny every call with a
+        # reason the caller can read, which beats a silent absence.
+        backend_status_map["mail"] = mail_mcp.attach_synthetic_backend(
+            BackendStatus, BackendConfig, name="mail")
+        log.info("Mail tools registered as a synthetic compound backend")
 
         for compound in compounds:
             try:
@@ -2645,6 +2667,27 @@ async def main():
         # Mount appended later (e.g. from inside lifespan) silently 404s. Its
         # StreamableHTTP session manager is started in lifespan() below, together
         # with the other mounted servers.
+        # Direct route /mcp/mail carries the SAME gate as the compounds: real
+        # backends wrap their direct routes in make_policy_handler (via
+        # register_backend_tools), and installing raw handlers here would let
+        # a caller reach the mailbox with no scope check at all.
+        mail_bc = BackendConfig(name="mail", path="/mcp/mail",
+                                default_deny="mail operation '${tool}' denied. "
+                                             "No matching policy rule.")
+        mail_rules = mail_mcp.mail_rules()
+        mail_status = BackendStatus(name="mail", config=mail_bc,
+                                    rules=mail_rules, healthy=True)
+        mail_server = MountedServer(
+            name="mail", port=http_port, allowed_hosts=allowed_hosts)
+        for mail_tool in mail_mcp.local_tools():
+            mail_server.tool(name=mail_tool.name,
+                             description=mail_tool.description,
+                             inputSchema=mail_tool.inputSchema)(
+                make_policy_handler(mail_bc, mail_rules, mail_tool.name,
+                                    mail_status))
+        all_routes.append(Mount("/mcp/mail", app=mail_server.get_app()))
+        log.info("Mail tools mounted at /mcp/mail (direct route policy-gated)")
+
         tg_server = None
         if _telegram_backend is not None:
             tg_server = MountedServer(
@@ -2664,7 +2707,7 @@ async def main():
                 # transport internally and don't need _http_manager.run().
                 # tg_server may be None (telegram disabled) — the hasattr guard
                 # skips it, same as FastMCP compound servers without one.
-                for server in [*mounted_servers, *compound_servers, tg_server]:
+                for server in [*mounted_servers, *compound_servers, mail_server, tg_server]:
                     if hasattr(server, "_http_manager"):
                         await stack.enter_async_context(server._http_manager.run())
                 # Start discovery watchdog for unhealthy backends
