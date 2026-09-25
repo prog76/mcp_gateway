@@ -79,7 +79,8 @@ def main() -> int:
         return 2
 
     # --- 1. status: names only, never a value ------------------------------
-    print("\nstatus:\n%s" % (mm._tool_status(),))
+    print("\nstatus:\n%s"
+          % (asyncio.new_event_loop().run_until_complete(mm._tool_status()),))
 
     # --- 2. live fetch -----------------------------------------------------
     args = {"account": account, "from_filter": "github.com",
