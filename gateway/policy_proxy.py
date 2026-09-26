@@ -659,8 +659,16 @@ class TelegramBackend:
             text_parts.append(f"Session: {session_id}")
 
         if notify_text:
-            # Verbatim template body - the author controls the content.
-            text = notify_text
+            # Custom template body + auto footer: the template controls the
+            # headline, but Client/Session attribution is appended by the
+            # gateway so every approval carries it (same lines as the
+            # default summary path below).
+            _footer = []
+            if client_info:
+                _footer.append(f"Client: {client_info.host} / {client_info.ip}")
+            if session_id:
+                _footer.append(f"Session: {session_id}")
+            text = notify_text + ("\n" + "\n".join(_footer) if _footer else "")
             if len(text) > 4000:
                 text = text[:4000] + "... (truncated)"
         else:

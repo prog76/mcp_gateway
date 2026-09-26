@@ -1438,6 +1438,28 @@ def test_notify_verbatim_body_sent():
     assert sent["text"] == "CUSTOM BODY"
 
 
+def test_notify_custom_body_gets_client_session_footer():
+    sent2 = {}
+    be2 = policy_proxy.TelegramBackend("tok", "123")
+
+    class StubClient2:
+        async def post(self, url, json=None):
+            sent2.update(json or {})
+            return StubResp()
+
+    async def scenario2():
+        await be2._client.aclose()
+        be2._client = StubClient2()
+        info = policy_proxy.ClientInfo(host="U2-2010", ip="172.18.0.1")
+        return await be2.send_approval_request(
+            "r2", "demo_push", {"a": "b"}, info, "why",
+            backend_name="demo", session_id="sess-9", notify_text="CUSTOM BODY")
+
+    ok2 = asyncio.run(scenario2())
+    assert ok2 is True
+    assert sent2["text"] == "CUSTOM BODY\nClient: U2-2010 / 172.18.0.1\nSession: sess-9"
+
+
 def test_validate_accepts_notify_template(tmp_path):
     p = tmp_path / "demo.yaml"
     p.write_text(
