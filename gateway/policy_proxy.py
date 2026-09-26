@@ -59,7 +59,7 @@ import gateway.telegram_mcp as telegram_mcp
 # Each owns its own tool layer and is dispatched through its own forward().
 # keyed by backend name so a compound listing `telegram` resolves to the
 # right handler table. (`mail` used to live here too; it is now a normal
-# upstream from config/policy/real/mail.yaml -> the standalone mail-mcp
+# upstream from config/policy/real/mail.yaml -> the standalone mcp-mail
 # service, because personal IMAP passwords do not belong in this process.)
 _SYNTHETIC_BACKENDS = {"telegram": telegram_mcp}
 from gateway import oauth as gateway_oauth
@@ -2604,7 +2604,7 @@ async def main():
             compound_backend_map["telegram"] = BackendConfig(name="telegram")
         # `mail` needs no special case any more: it arrives with backend_config_map
         # like every other backend, because it IS one now (policy file -> the
-        # standalone mail-mcp service in the private contour).
+        # standalone mcp-mail service in the private contour).
         compounds = load_compounds(compounds_path, compound_backend_map)
 
         compound_statuses: List[CompoundStatus] = []
