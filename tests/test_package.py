@@ -1442,6 +1442,17 @@ def test_notify_custom_body_gets_client_session_footer():
     sent2 = {}
     be2 = policy_proxy.TelegramBackend("tok", "123")
 
+    # This test needs its own StubResp: the one in
+    # test_notify_verbatim_body_sent above is function-local and goes out
+    # of scope with it, so referencing it here raised NameError and broke
+    # the CI test job on the v0.1.43 tag (publish-image never ran).
+    class StubResp:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 1, "chat": {"id": 123}}}
+
     class StubClient2:
         async def post(self, url, json=None):
             sent2.update(json or {})
