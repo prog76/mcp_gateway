@@ -1169,6 +1169,71 @@ def load_compounds(compounds_path: str, available_backends: Dict[str, BackendCon
 
 
 # ---------------------------------------------------------------------------
+# Confirm-render enrichment (kanban t_a37a0231)
+# ---------------------------------------------------------------------------
+# The approval text is rendered from the *explicit* call args, but backends
+# apply defaults the caller never sent (git_push path="." from the schema,
+# remote/branch resolved inside the backend). The operator must see the
+# EFFECTIVE context - where the call will really land - so fill those
+# defaults into a render COPY before resolving notify/confirm templates.
+# The forwarded call (kw) is never touched.
+
+# Session working dirs observed on git_set_working_dir calls.
+# Keyed (backend, session_id) so sessions never leak into each other.
+_GIT_SESSION_DIRS: Dict[Tuple[str, str], str] = {}
+
+
+def _remember_git_working_dir(backend_name: str, arguments: dict) -> None:
+    """Remember the session working dir set via git_set_working_dir."""
+    try:
+        sid = arguments.get("session_id")
+        path = arguments.get("path")
+        if isinstance(sid, str) and sid and isinstance(path, str) and path:
+            _GIT_SESSION_DIRS[(backend_name, sid)] = path
+    except Exception:
+        pass
+
+
+def _schema_defaults_for(status: BackendStatus, tool_name: str) -> dict:
+    """Scalar `default` values from the advertised inputSchema (generic)."""
+    out: dict = {}
+    try:
+        for t in getattr(status, "tools", None) or []:
+            if getattr(t, "name", None) != tool_name:
+                continue
+            schema = (
+                getattr(t, "inputSchema", None)
+                or getattr(t, "input_schema", None)
+                or {}
+            )
+            props = (schema or {}).get("properties", {}) or {}
+            for key, spec in props.items():
+                if isinstance(spec, dict) and "default" in spec:
+                    default = spec["default"]
+                    if isinstance(default, (str, int, float, bool)):
+                        out[key] = default
+            break
+    except Exception:
+        pass
+    return out
+
+
+def _enrich_confirm_args(bc, status: BackendStatus, tool_name: str,
+                         arguments: dict) -> dict:
+    """Render copy with effective values; never mutates the caller's dict."""
+    enriched = dict(arguments)
+    if tool_name == "git_set_working_dir":
+        return enriched
+    sid = arguments.get("session_id")
+    if isinstance(sid, str) and sid and "path" not in enriched:
+        remembered = _GIT_SESSION_DIRS.get((bc.name, sid))
+        if remembered:
+            enriched["path"] = remembered
+    for key, value in _schema_defaults_for(status, tool_name).items():
+        enriched.setdefault(key, value)
+    return enriched
+
+# ---------------------------------------------------------------------------
 # Template resolution
 # ---------------------------------------------------------------------------
 
@@ -1218,7 +1283,16 @@ def resolve_template(template: str, tool_name: str, arguments: dict) -> str:
             name = fp[15:]
             return incoming.get(name, m.group(0))
         val = _get_nested(arguments, fp[5:] if fp.startswith("args.") else fp)
-        return str(val) if val is not None else m.group(0)
+        if val is None:
+            # Fail LOUD for tool args (kanban t_a37a0231): a notify_template
+            # naming an arg the call did not carry used to render as a literal
+            # template fragment, hiding the gap from the operator. Mark it so
+            # a bad template is visible at rule-authoring time. Non-arg vars
+            # (tool/backend/reason/header/...) keep the old verbatim fallback.
+            if fp.startswith("args."):
+                return "[unresolved:" + fp + "]"
+            return m.group(0)
+        return str(val)
     return re.sub(r'\$\{(.+?)\}', replacer, template)
 
 
@@ -1881,20 +1955,26 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     pending.client_key = allowance_key[0] if allowance_key else ""
                     _pending_requests[request_id] = pending
                     started_ts = time.monotonic()
+                    # Effective render context (kanban t_a37a0231): the operator
+                    # must see where the call will REALLY land, not just the
+                    # explicit args. Schema defaults + remembered session working
+                    # dir go into a render COPY; kw (forwarded) is untouched.
+                    render_kw = _enrich_confirm_args(bc, status, tn, policy_kw)
+
 
                     # Resolve templates for the messages
-                    reason = resolve_template(rule.get("reason", "Operator declined"), tn, policy_kw)
+                    reason = resolve_template(rule.get("reason", "Operator declined"), tn, render_kw)
                     pending_template = resolve_template(
                         rule.get("confirm_pending", "⏳ Approval requested for ${tool}."),
-                        tn, policy_kw,
+                        tn, render_kw,
                     )
                     denied_template = resolve_template(
                         rule.get("confirm_denied", "ACCESS DENIED: ${reason}"),
-                        tn, {**policy_kw, "reason": reason},
+                        tn, {**render_kw, "reason": reason},
                     )
                     timeout_template = resolve_template(
                         rule.get("confirm_timeout", "The operator did not answer in time."),
-                        tn, policy_kw,
+                        tn, render_kw,
                     )
                     approved_template = rule.get("confirm_approved",
                                                   "✅ Operator approved. Result:\n\n${result}")
@@ -1912,7 +1992,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     notify_text = (
                         resolve_template(
                             notify_raw, tn,
-                            {**policy_kw, "reason": reason, "backend": bc.name},
+                            {**render_kw, "reason": reason, "backend": bc.name},
                         ) if notify_raw else ""
                     )
 
@@ -1931,7 +2011,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     sent = await _telegram_backend.send_approval_request(
                         request_id=request_id,
                         tool_name=tn,
-                        arguments=policy_kw,
+                        arguments=render_kw,
                         client_info=info,
                         reason=reason,
                         backend_name=bc.name,
@@ -2023,7 +2103,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     # Resolve approved template with ${result}
                     rendered = resolve_template(
                         approved_template, tn,
-                        {**policy_kw, "result": result_text},
+                        {**render_kw, "result": result_text},
                     )
                     # Preserve the upstream structured content + isError end-to-end.
                     # Returning a plain str here makes the MCP SDK client fail an
@@ -2041,10 +2121,12 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     return rendered
 
                 elif action == "allow":
-                    # Explicit: `allow` used to fall through the catch-all
-                    # `else` below, which is exactly why that `else` could not
-                    # be tightened on its own.
+                    # Explicit: `allow` without extra match fields ends the
+                    # rule scan here; a narrower allow with argument conditions
+                    # lives in its own rule above and matches on its own terms.
                     rule_matched = True
+                    if tn == "git_set_working_dir":
+                        _remember_git_working_dir(bc.name, policy_kw)
                     break
 
                 else:

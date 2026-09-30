@@ -1480,6 +1480,112 @@ def test_validate_accepts_notify_template(tmp_path):
         '  - match:\n      tool: ".*"\n    action: deny\n    reason: "no"\n'
     )
     assert validate_policy.validate_policy(str(p)) is True
+
+# ---------------------------------------------------------------------------
+# Effective approval context - kanban t_a37a0231.
+# The operator must see where a confirm call will REALLY land, not just the
+# explicit args. Templates render from an enriched copy (schema defaults +
+# remembered git session working dir); the forwarded call is untouched.
+# A template naming an arg nobody sent renders [unresolved:args.*], never a
+# silent literal.
+# ---------------------------------------------------------------------------
+
+
+def test_notify_unresolved_args_marker():
+    assert policy_proxy.resolve_template(
+        "push ${args.remote} ${args.branch}", "demo_push",
+        {"remote": "origin"},
+    ) == "push origin [unresolved:args.branch]"
+    # Non-arg vars keep the old verbatim fallback.
+    assert policy_proxy.resolve_template(
+        "from ${clientHost}", "t", {},
+    ) == "from ${clientHost}"
+    assert policy_proxy.resolve_template(
+        "v ${header:X-Missing}", "t", {},
+    ) == "v ${header:X-Missing}"
+
+
+def _fake_status_for(tool_name, properties):
+    class _T:
+        pass
+    t = _T()
+    t.name = tool_name
+    t.inputSchema = {"type": "object", "properties": properties}
+    st = policy_proxy.BackendStatus(name="git", healthy=True)
+    st.tools = [t]
+    return st
+
+
+def test_enrich_confirm_args_schema_defaults():
+    bc = policy_proxy.BackendConfig(name="git", url="http://git/mcp", transport="http")
+    st = _fake_status_for(
+        "git_push",
+        {"path": {"type": "string", "default": "."},
+         "force": {"type": "boolean", "default": False}},
+    )
+    out = policy_proxy._enrich_confirm_args(bc, st, "git_push", {"session_id": "public"})
+    assert out == {"session_id": "public", "path": ".", "force": False}
+    # Explicit args win; the caller's dict is never mutated.
+    src = {"session_id": "public", "path": "/explicit"}
+    out2 = policy_proxy._enrich_confirm_args(bc, st, "git_push", src)
+    assert out2["path"] == "/explicit"
+    assert src == {"session_id": "public", "path": "/explicit"}
+
+
+def test_enrich_confirm_args_remembers_working_dir():
+    bc = policy_proxy.BackendConfig(name="git", url="http://git/mcp", transport="http")
+    st = policy_proxy.BackendStatus(name="git", healthy=True)
+    st.tools = []
+    policy_proxy._GIT_SESSION_DIRS.pop(("git", "sess-wd"), None)
+    policy_proxy._GIT_SESSION_DIRS.pop(("git", "other"), None)
+    policy_proxy._remember_git_working_dir(
+        "git", {"session_id": "sess-wd", "path": "/workspace/llm/deploy"})
+    try:
+        out = policy_proxy._enrich_confirm_args(bc, st, "git_push", {"session_id": "sess-wd"})
+        assert out["path"] == "/workspace/llm/deploy"
+        # Sessions never leak into each other.
+        out_other = policy_proxy._enrich_confirm_args(bc, st, "git_push", {"session_id": "other"})
+        assert "path" not in out_other
+    finally:
+        policy_proxy._GIT_SESSION_DIRS.pop(("git", "sess-wd"), None)
+
+
+def test_confirm_notify_uses_effective_context():
+    # The live incident shape: the call carried only session_id, so every
+    # other field must be an explicit marker, never a silent literal.
+    cap, _ = _run_confirm_capture(
+        notify_rule="push [${args.session_id}] ${args.path} -> ${args.remote}/${args.branch} force=${args.force}",
+        tool="git_push",
+        args={"session_id": "public"},
+    )
+    assert "${args" not in cap["notify_text"]
+    assert "[unresolved:args.path]" in cap["notify_text"]
+    assert "[unresolved:args.remote]" in cap["notify_text"]
+    assert "[unresolved:args.branch]" in cap["notify_text"]
+
+
+def test_confirm_notify_shows_remembered_working_dir():
+    # _run_confirm_capture uses backend name "demo"; pre-seed its memory.
+    policy_proxy._GIT_SESSION_DIRS[("demo", "public")] = "/workspace/llm/deploy"
+    try:
+        cap, _ = _run_confirm_capture(
+            notify_rule="push ${args.path}",
+            tool="git_push",
+            args={"session_id": "public"},
+        )
+        assert cap["notify_text"] == "push /workspace/llm/deploy"
+    finally:
+        policy_proxy._GIT_SESSION_DIRS.pop(("demo", "public"), None)
+
+
+def test_effective_render_resolves_schema_default():
+    bc = policy_proxy.BackendConfig(name="git", url="http://git/mcp", transport="http")
+    st = _fake_status_for(
+        "git_push", {"path": {"type": "string", "default": "."}})
+    render = policy_proxy._enrich_confirm_args(bc, st, "git_push", {"session_id": "public"})
+    assert policy_proxy.resolve_template(
+        "push ${args.path}", "git_push", render) == "push ."
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
