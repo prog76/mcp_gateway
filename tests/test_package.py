@@ -1337,7 +1337,8 @@ def test_exceptiongroup_debug_hint_documented():
 # Per-rule notify_template for Telegram approval messages
 # ---------------------------------------------------------------------------
 
-def _run_confirm_capture(notify_rule=None, global_template="", tool="demo_push", args=None):
+def _run_confirm_capture(notify_rule=None, global_template="", tool="demo_push", args=None,
+                         approve=True, deny_reason=None):
     captured = {}
     bc = policy_proxy.BackendConfig(name="demo", url="http://demo/mcp", transport="http")
     status = policy_proxy.BackendStatus(name="demo", healthy=True)
@@ -1374,7 +1375,9 @@ def _run_confirm_capture(notify_rule=None, global_template="", tool="demo_push",
             await asyncio.sleep(0.01)
         assert policy_proxy._pending_requests, "confirm never created a pending request"
         _rid, pending = next(iter(policy_proxy._pending_requests.items()))
-        pending.approved = True
+        pending.approved = approve
+        if deny_reason:
+            pending.deny_reason = deny_reason
         pending.event.set()
         return await task
 
@@ -1469,6 +1472,67 @@ def test_notify_custom_body_gets_client_session_footer():
     ok2 = asyncio.run(scenario2())
     assert ok2 is True
     assert sent2["text"] == "CUSTOM BODY\nClient: U2-2010 / 172.18.0.1\nSession: sess-9"
+
+
+def test_approval_reply_declines_with_reason():
+    """A free-text reply to the approval message = decline + reason."""
+    be = policy_proxy.TelegramBackend("tok", "123")
+    edited = {}
+
+    class StubResp:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {"ok": True}
+
+    class StubClient:
+        async def post(self, url, json=None):
+            edited.update(json or {})
+            return StubResp()
+
+    async def scenario():
+        await be._client.aclose()
+        be._client = StubClient()
+        pending = policy_proxy.PendingRequest(
+            request_id="r-den1", message_id=77, chat_id=-100,
+        )
+        policy_proxy._pending_requests["r-den1"] = pending
+        msg = {
+            "text": "wrong cluster, use infra.test",
+            "chat": {"id": -100},
+            "from": {"first_name": "Anton"},
+            "reply_to_message": {
+                "message_id": 77,
+                "text": "x Approval Required\nStatus: waiting for approval",
+            },
+        }
+        try:
+            assert await be._try_approval_reply(msg) is True
+            assert pending.approved is False
+            assert pending.deny_reason == "wrong cluster, use infra.test"
+            assert pending.event.is_set()
+            assert "declined by Anton" in edited.get("text", "")
+            # A reply that does not target a pending approval must NOT be
+            # swallowed here - the generic ask flow still sees it.
+            msg2 = dict(msg)
+            msg2["reply_to_message"] = {"message_id": 999, "text": "x"}
+            assert await be._try_approval_reply(msg2) is False
+        finally:
+            policy_proxy._pending_requests.pop("r-den1", None)
+
+    asyncio.run(scenario())
+
+
+def test_denied_result_carries_operator_reply_reason():
+    _, out = _run_confirm_capture(
+        args={"remote": "origin"},
+        approve=False,
+        deny_reason="wrong cluster, use infra.test",
+    )
+    text = out.content[0].text if hasattr(out, "content") and out.content else str(out)
+    assert "ACCESS DENIED" in text
+    assert "Reason given by the operator: wrong cluster, use infra.test" in text
 
 
 def test_validate_accepts_notify_template(tmp_path):

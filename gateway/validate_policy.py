@@ -100,7 +100,7 @@ def _validate_backend_policy(raw: dict, path: str) -> bool:
                 if tpl and "${" in tpl:
                     # Check that template variables are well-formed
                     for var in re.findall(r'\$\{(.+?)\}', tpl):
-                        if var not in ("tool", "backend", "reason", "result") and not var.startswith("args.") and not var.startswith("header:") and not var.startswith("request_header:") and var not in ("clientHost", "clientIp") and not var.startswith("env:"):
+                        if var not in ("tool", "backend", "reason", "result", "deny_reason") and not var.startswith("args.") and not var.startswith("header:") and not var.startswith("request_header:") and var not in ("clientHost", "clientIp") and not var.startswith("env:"):
                             print(f"WARNING: Rule {i}: unknown template variable '${{{var}}}' in {tpl_field}")
         elif action not in ("allow", "deny", "inject_argument", "confirm", "confirm-hard"):
             print(f"WARNING: Rule {i}: unknown action '{action}' — treated as allow")

@@ -438,6 +438,10 @@ class PendingRequest:
     client_key: str = ""
     backend_name: str = ""
     rule_index: int = -1
+    # Operator free-text reason when the request is declined by REPLYING to
+    # the approval message (typed reply = decline-with-explanation; buttons
+    # remain the approve path). None when no reply was given.
+    deny_reason: Optional[str] = None
 
 
 # Global store of pending approval requests: request_id -> PendingRequest
@@ -920,6 +924,8 @@ class TelegramBackend:
                     # 'cq' on idle polls with an empty update batch) and skip
                     # messages whenever the last update was a callback.
                     msg = update.get("message")
+                    if msg and await self._try_approval_reply(msg):
+                        continue
                     if msg and await self._try_ask_message(msg):
                         continue
 
@@ -928,6 +934,58 @@ class TelegramBackend:
             except Exception as e:
                 log.warning("Telegram poll error: %s", e)
                 await asyncio.sleep(self.poll_interval)
+
+    async def _try_approval_reply(self, msg: dict) -> bool:
+        """Treat a free-text REPLY to a pending approval as decline + reason.
+
+        Approvals are answered by buttons (approve / allow1m / reject); a
+        typed reply to the approval message is the text channel operators
+        asked for: it resolves the request as DENIED and carries the words
+        to the agent with the denied result. No command syntax - replying
+        IS the answer. Returns True when consumed, so the poll loop must not
+        also feed the message to the generic ask flow.
+        """
+        reply = msg.get("reply_to_message") or {}
+        replied_id = reply.get("message_id")
+        chat_id = (msg.get("chat") or {}).get("id")
+        text = str(msg.get("text") or "").strip()
+        if not replied_id or not text:
+            return False
+        pending = None
+        for entry in _pending_requests.values():
+            if entry.message_id == replied_id and entry.chat_id == chat_id:
+                pending = entry
+                break
+        if pending is None:
+            return False
+
+        pending.approved = False
+        pending.deny_reason = text[:500]
+        operator_name = (msg.get("from") or {}).get("first_name", "Operator")
+        status_text = f"Status: declined by {operator_name} - {text[:200]}\n"
+        original_text = str(reply.get("text") or "")
+        if "Status:" in original_text:
+            updated_text = re.sub(
+                r"Status:[^\n]*",
+                lambda _m: status_text.rstrip("\n"),
+                original_text,
+                count=1,
+            )
+        else:
+            updated_text = (
+                original_text.rstrip("\n") + "\n\n" + status_text
+            )
+        if pending.chat_id is not None and pending.message_id:
+            await self._edit_message(
+                pending.chat_id, pending.message_id, updated_text,
+                remove_keyboard=True,
+            )
+        log.info(
+            "Telegram approval %s declined by reply from %s: %s",
+            pending.request_id[:8], operator_name, pending.deny_reason,
+        )
+        pending.event.set()
+        return True
 
     async def _try_ask_callback(self, cq, data: str) -> bool:
         """Try to resolve a generic ask from a callback_query."""
@@ -1970,7 +2028,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     )
                     denied_template = resolve_template(
                         rule.get("confirm_denied", "ACCESS DENIED: ${reason}"),
-                        tn, {**render_kw, "reason": reason},
+                        tn, {**render_kw, "reason": reason, "deny_reason": ""},
                     )
                     timeout_template = resolve_template(
                         rule.get("confirm_timeout", "The operator did not answer in time."),
@@ -1983,7 +2041,7 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                     # notify_template wins, then the global telegram.template
                     # from notifications.yaml; empty = default args summary.
                     # Vars: ${tool}, ${backend}, ${reason}, ${args.*},
-                    # ${clientHost}, ${clientIp}. Verbatim - the template IS
+                    # ${clientHost}, ${clientIp}, ${deny_reason}. Verbatim - the template IS
                     # the message body (no auto-appended fields).
                     notify_raw = rule.get("notify_template", "") or (
                         _notification_config.telegram_template
@@ -2087,7 +2145,16 @@ def make_policy_handler(bc, rules, tool_name, status: BackendStatus):
                                     total=float(timeout),
                                     message=f"❌ Operator declined the approval request ({request_id[:8]}…)",
                                 )
-                        return _error_result(denied_template)
+                        denied_text = denied_template
+                        if pending.deny_reason:
+                            denied_text = resolve_template(
+                                denied_template
+                                + " Reason given by the operator: ${deny_reason}",
+                                tn,
+                                {**render_kw, "reason": reason,
+                                 "deny_reason": pending.deny_reason},
+                            )
+                        return _error_result(denied_text)
 
                     # Operator approved — forward to real backend
                     if injections:
