@@ -16,20 +16,36 @@
 # mcp2cli is pinned transitively via the dependency declared in pyproject.toml
 # (so a single spec is the source of truth and pip never sees a conflict).
 
-FROM python:3.12-slim
+ARG PYTHON_SLIM_BASE=python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+FROM ${PYTHON_SLIM_BASE}
+
+# ------------------------------------------------------------------
+# System dependencies -- CANONICAL APT PREAMBLE (byte-identical across
+# images so the apt layer is shared). Order matters: keep it verbatim.
+# ------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+# ------------------------------------------------------------------
+# Core python deps
+# ------------------------------------------------------------------
+# Shared layers -- byte-identical across images so BuildKit reuses them.
+# TRACK A (gateway/sandbox/secure-fox): fastmcp 3.x, mcp 1.x. Frozen from
+# the live mcp-gateway container (pip freeze, 2026-10).
+RUN pip install --no-cache-dir httpx==0.28.1
+RUN pip install --no-cache-dir PyYAML==6.0.3
+RUN pip install --no-cache-dir websockets==17.1
+RUN pip install --no-cache-dir fastmcp==3.4.7
+RUN pip install --no-cache-dir mcp==1.30.0
+RUN pip install --no-cache-dir jsonschema==4.26.0
 
 ARG SHELL_CHROOT_DIR=/opt/shell-chroot
 ARG GATEWAY_VERSION=main
 ARG SECUREFOX_VERSION=v0.1.4
 
-# ------------------------------------------------------------------
-# System dependencies
-# ------------------------------------------------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    openssh-client \
-    git \
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # ------------------------------------------------------------------
@@ -49,17 +65,6 @@ RUN curl -fsSL "https://github.com/kubevirt/kubevirt/releases/download/${VIRTCTL
 # pexpect — needed for virtctl console interaction via exec backend
 # ------------------------------------------------------------------
 RUN pip install --no-cache-dir pexpect
-
-# ------------------------------------------------------------------
-# Core python deps
-# ------------------------------------------------------------------
-RUN pip install --no-cache-dir \
-    "mcp>=1.28.1,<2" \
-    "fastmcp>=3.4.2,<4" \
-    "jsonschema>=4.0.0" \
-    "pyyaml>=6.0" \
-    "httpx>=0.27.0" \
-    "websockets>=12.0"
 
 # ------------------------------------------------------------------
 # Extracted packages (pip from GitHub).
