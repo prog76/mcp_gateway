@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir jsonschema==4.26.0
 
 ARG SHELL_CHROOT_DIR=/opt/shell-chroot
 ARG GATEWAY_VERSION=main
-ARG SECUREFOX_VERSION=v0.1.4
+ARG SECUREFOX_VERSION=v0.1.5
 
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/*
