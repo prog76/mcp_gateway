@@ -358,6 +358,19 @@ class MountedServer:
                     return types.CallToolResult(
                         content=[TextContent(type="text", text=result)]
                     )
+                elif isinstance(result, dict):
+                    raw_content = result.get("content", [])
+                    if not isinstance(raw_content, list):
+                        raw_content = [str(raw_content)]
+                    content = [
+                        c if isinstance(c, TextContent) else TextContent(type="text", text=str(c))
+                        for c in raw_content
+                    ]
+                    return types.CallToolResult(
+                        content=content,
+                        structured_content=result.get("structuredContent"),
+                        isError=result.get("isError", False),
+                    )
                 return types.CallToolResult(
                     content=result if isinstance(result, list) else [TextContent(type="text", text=str(result))]
                 )
@@ -548,6 +561,19 @@ class MountedServer:
                         elif isinstance(result, str):
                             return types.CallToolResult(
                                 content=[TextContent(type="text", text=result)]
+                            )
+                        elif isinstance(result, dict):
+                            raw_content = result.get("content", [])
+                            if not isinstance(raw_content, list):
+                                raw_content = [str(raw_content)]
+                            content = [
+                                c if isinstance(c, TextContent) else TextContent(type="text", text=str(c))
+                                for c in raw_content
+                            ]
+                            return types.CallToolResult(
+                                content=content,
+                                structured_content=result.get("structuredContent"),
+                                isError=result.get("isError", False),
                             )
                         return types.CallToolResult(
                             content=result if isinstance(result, list) else [TextContent(type="text", text=str(result))]
