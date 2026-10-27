@@ -2669,9 +2669,125 @@ async def create_compound_server(compound: CompoundConfig,
 
     return server, compound_status
 
+# ---------------------------------------------------------------------------
+# POST /approve — gate for CLI wrappers (git, kubectl, ...)
+#
+# A wrapper calls this when its policy rule says `confirm`. The endpoint
+# reuses the gateway's existing confirm machinery:
+#   TelegramBackend.send_approval_request  -> post Approve/Reject buttons
+#   PendingRequest + asyncio.Event         -> block until the operator answers
+#   poll_loop()                            -> long-poll Telegram getUpdates
+#
+# Body: {tool, args, reason} -> {approved, request_id}
+# Blocks until operator answers or APPROVE_TIMEOUT_SECONDS expires.
+# ---------------------------------------------------------------------------
+
+APPROVE_TIMEOUT_SECONDS = float(os.environ.get("APPROVE_TIMEOUT_SECONDS", "90"))
+
+
+async def approve_endpoint(request: Request) -> JSONResponse:
+    """Gate a wrapper operation through Telegram approval.
+
+    Called by the universal wrapper (git/kubectl) when a policy rule has
+    action `confirm`. Sends an approval request to the operator chat and
+    blocks until the operator clicks Approve/Reject or the timeout expires.
+    """
+    if _telegram_backend is None:
+        return JSONResponse(
+            {"approved": False, "error": "Telegram notification backend not configured"},
+            status_code=503,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"approved": False, "error": "invalid JSON body"},
+            status_code=400,
+        )
+
+    tool = str(body.get("tool", "unknown"))
+    args = body.get("args", {}) or {}
+    reason = str(body.get("reason", "Approval required"))
+
+    request_id = str(uuid.uuid4())
+    pending = PendingRequest(request_id=request_id)
+    _pending_requests[request_id] = pending
+
+    info = _client_info.get()
+
+    sent = await _telegram_backend.send_approval_request(
+        request_id=request_id,
+        tool_name=tool,
+        arguments=args,
+        client_info=info,
+        reason=reason,
+        backend_name="wrapper",
+        session_id="",
+        notify_text="",
+        allow_session_grant=False,
+    )
+    if not sent:
+        _pending_requests.pop(request_id, None)
+        return JSONResponse(
+            {"approved": False, "error": "failed to send approval request to operator"},
+            status_code=502,
+        )
+
+    # Determine timeout: global notification config, then env default.
+    timeout = APPROVE_TIMEOUT_SECONDS
+    if _notification_config is not None:
+        timeout = _notification_config.timeout
+
+    started_ts = time.monotonic()
+    try:
+        await asyncio.wait_for(pending.event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        _pending_requests.pop(request_id, None)
+        await _telegram_backend.edit_request_timeout(request_id)
+        _missed = getattr(_telegram_backend, "notify_missed_approval", None)
+        if _missed is not None:
+            with contextlib.suppress(Exception):
+                await _missed(
+                    request_id=request_id,
+                    tool_name=tool,
+                    backend_name="wrapper",
+                    timeout_seconds=timeout,
+                )
+        log.warning(
+            "WRAPPER /approve %s AWAITING_APPROVAL (confirm, no operator answer in %ss, request %s)",
+            tool, int(timeout), request_id[:8],
+        )
+        return JSONResponse(
+            {
+                "approved": False,
+                "error": "approval timed out",
+                "request_id": request_id,
+                "retryable": True,
+            },
+            status_code=200,
+        )
+
+    _pending_requests.pop(request_id, None)
+
+    if not pending.approved:
+        return JSONResponse(
+            {
+                "approved": False,
+                "error": "operator declined",
+                "deny_reason": pending.deny_reason or "",
+                "request_id": request_id,
+            },
+            status_code=200,
+        )
+
+    log.info("WRAPPER /approve %s APPROVED (request %s)", tool, request_id[:8])
+    return JSONResponse({"approved": True, "request_id": request_id}, status_code=200)
+
 
 async def main():
     backends = load_all_policies(POLICY_DIR)
+
     log.info("Loaded %d backends", len(backends))
 
     # Load global notification config
@@ -2793,6 +2909,7 @@ async def main():
         # Build routes: /health (with status tracking) + each backend + each compound
         all_routes = [
             Route("/health", endpoint=build_health_handler(backend_statuses)),
+            Route("/approve", endpoint=approve_endpoint, methods=["POST"]),
         ]
 
         for path, server in zip(
