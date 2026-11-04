@@ -2669,16 +2669,83 @@ async def create_compound_server(compound: CompoundConfig,
 
     return server, compound_status
 
+def evaluate_policy_content(policy_content: str, tool: str, args: dict) -> dict:
+    """Evaluate policy YAML content for a tool. Returns the matching rule or default deny.
+
+    Uses full PyYAML so YAML anchors (e.g. *readonly) resolve correctly —
+    unlike the wrapper's minimal parser which skips them.
+    """
+    try:
+        raw = yaml.load(policy_content, Loader=PolicyLoader)
+    except Exception as e:
+        return {'action': 'deny', 'reason': f'cannot parse policy: {e}'}
+
+    if not raw or not isinstance(raw, dict):
+        return {'action': 'deny', 'reason': 'empty or invalid policy'}
+
+    rules = raw.get("rules", [])
+    default_deny = raw.get("default_deny",
+                           f"'{tool}' denied. No matching policy rule.")
+
+    for rule in rules:
+        match = rule.get("match")
+        if not isinstance(match, dict):
+            continue
+        tool_pattern = match.get("tool")
+        if tool_pattern is None:
+            continue
+
+        # Normalize list values (from !concat/anchors) to regex
+        if isinstance(tool_pattern, list):
+            if not tool_pattern:
+                continue
+            pattern = "^(?:" + "|".join(str(v) for v in tool_pattern) + ")$"
+        else:
+            pattern = str(tool_pattern)
+
+        try:
+            if not re.search(pattern, tool):
+                continue
+        except re.error:
+            continue
+
+        # Check additional match fields (context, kind, etc.)
+        match_ok = True
+        for fp, rx in match.items():
+            if fp == "tool":
+                continue
+            if isinstance(rx, list):
+                if not rx:
+                    match_ok = False
+                    break
+                rx_str = "^(?:" + "|".join(str(v) for v in rx) + ")$"
+            else:
+                rx_str = str(rx)
+            val = _get_nested(args, fp)
+            if val is None or not re.search(rx_str, str(val)):
+                match_ok = False
+                break
+
+        if match_ok:
+            return rule
+
+    return {'action': 'deny', 'reason': default_deny}
+
+
 # ---------------------------------------------------------------------------
 # POST /approve — gate for CLI wrappers (git, kubectl, ...)
 #
 # A wrapper calls this when its policy rule says `confirm`. The endpoint
-# reuses the gateway's existing confirm machinery:
+# evaluates the wrapper's policy file first:
+#   allow  -> return approved immediately (no Telegram)
+#   deny   -> return rejected immediately (no Telegram)
+#   confirm-> send Telegram, block until operator answers
+#
+# Reuses the gateway's existing confirm machinery:
 #   TelegramBackend.send_approval_request  -> post Approve/Reject buttons
 #   PendingRequest + asyncio.Event         -> block until the operator answers
-#   poll_loop()                            -> long-poll Telegram getUpdates
 #
-# Body: {tool, args, reason} -> {approved, request_id}
+# Body: {tool, args, policy_content} -> {approved, request_id, error}
 # Blocks until operator answers or APPROVE_TIMEOUT_SECONDS expires.
 # ---------------------------------------------------------------------------
 
@@ -2689,8 +2756,13 @@ async def approve_endpoint(request: Request) -> JSONResponse:
     """Gate a wrapper operation through Telegram approval.
 
     Called by the universal wrapper (git/kubectl) when a policy rule has
-    action `confirm`. Sends an approval request to the operator chat and
-    blocks until the operator clicks Approve/Reject or the timeout expires.
+    action `confirm`. Evaluates the wrapper's policy file first:
+      - allow: return approved immediately (no Telegram)
+      - deny: return rejected immediately (no Telegram)
+      - confirm: send Telegram, block until operator answers
+
+    Body: {tool, args, policy_content} -> {approved, request_id, error}
+    Blocks until operator answers or APPROVE_TIMEOUT_SECONDS expires.
     """
     if _telegram_backend is None:
         return JSONResponse(
@@ -2708,7 +2780,27 @@ async def approve_endpoint(request: Request) -> JSONResponse:
 
     tool = str(body.get("tool", "unknown"))
     args = body.get("args", {}) or {}
-    reason = str(body.get("reason", "Approval required"))
+    policy_content = body.get("policy_content")
+
+    # Evaluate policy content first: allow/deny immediate, confirm -> Telegram
+    policy_reason = "Approval required"
+    if policy_content:
+        policy_result = evaluate_policy_content(policy_content, tool, args)
+        action = policy_result.get("action", "deny")
+        policy_reason = policy_result.get("reason", policy_reason)
+
+        if action == "allow":
+            log.info("WRAPPER /approve %s ALLOW (policy content)", tool)
+            return JSONResponse({"approved": True, "request_id": None}, status_code=200)
+
+        if action == "deny":
+            log.info("WRAPPER /approve %s DENY: %s", tool, policy_reason)
+            return JSONResponse(
+                {"approved": False, "error": policy_reason, "request_id": None},
+                status_code=200,
+            )
+
+        # action == "confirm" — fall through to Telegram flow below
 
     request_id = str(uuid.uuid4())
     pending = PendingRequest(request_id=request_id)
@@ -2721,7 +2813,7 @@ async def approve_endpoint(request: Request) -> JSONResponse:
         tool_name=tool,
         arguments=args,
         client_info=info,
-        reason=reason,
+        reason=policy_reason,
         backend_name="wrapper",
         session_id="",
         notify_text="",
